@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 from typing import Any, Optional
 
@@ -21,8 +22,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
+    SUPPORTED_IMAGE_DOCUMENT_TYPES,
     cache_audio_from_url,
     cache_document_from_bytes,
+    cache_image_from_bytes,
     cache_image_from_url,
 )
 
@@ -162,8 +166,26 @@ class VKAdapter(BasePlatformAdapter):
             logger.exception("VK send failed peer_id=%s", peer_id)
             return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
 
-    async def send_document(self, chat_id: str, document_path: str, caption: str = "") -> SendResult:
-        return await self.send_media_files(chat_id, [document_path], caption)
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        file_names = [file_name] if file_name else None
+        return await self.send_media_files(
+            chat_id,
+            [file_path],
+            caption or "",
+            file_names=file_names,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         peer_id = _safe_int(chat_id)
@@ -180,29 +202,77 @@ class VKAdapter(BasePlatformAdapter):
         chat_id: str,
         media_files: list[str],
         caption: str = "",
+        *,
+        file_names: Optional[list[str | None]] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
+        for file_path in media_files:
+            if not os.path.exists(file_path):
+                return SendResult(success=False, error=f"VK document path does not exist: {file_path}")
         try:
-            refs = [await self._upload_document(peer_id=peer_id, path=file_path) for file_path in media_files]
-            response = await self.client.send_message(
-                peer_id=peer_id,
-                message=caption,
-                attachment=",".join(refs),
-            )
+            refs = []
+            for index, file_path in enumerate(media_files):
+                title = file_names[index] if file_names and index < len(file_names) else None
+                refs.append(await self._upload_document(peer_id=peer_id, path=file_path, title=title))
+            try:
+                send_kwargs: dict[str, Any] = {
+                    "peer_id": peer_id,
+                    "message": caption,
+                    "attachment": ",".join(refs),
+                }
+                if reply_to:
+                    send_kwargs["reply_to"] = reply_to
+                response = await self.client.send_message(**send_kwargs)
+            except VKApiError as exc:
+                if not reply_to or "reply_to" not in str(exc):
+                    raise
+                logger.info("VK media reply_to rejected for peer_id=%s; retrying without reply_to", peer_id)
+                response = await self.client.send_message(
+                    peer_id=peer_id,
+                    message=caption,
+                    attachment=",".join(refs),
+                )
             return SendResult(success=True, message_id=str(response))
+        except VKApiError as exc:
+            error = self._media_vk_api_error(exc)
+            if error == str(exc):
+                logger.exception("VK media send failed peer_id=%s", peer_id)
+            else:
+                logger.warning("VK media send failed peer_id=%s: %s", peer_id, error)
+            return SendResult(
+                success=False,
+                error=error,
+                retryable=self._is_retryable(exc),
+            )
         except Exception as exc:
             logger.exception("VK media send failed peer_id=%s", peer_id)
             return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
 
-    async def _upload_document(self, *, peer_id: int, path: str) -> str:
+    @staticmethod
+    def _media_vk_api_error(exc: VKApiError) -> str:
+        error = exc.payload.get("error")
+        code = error.get("error_code") if isinstance(error, dict) else None
+        if exc.method == "docs.getMessagesUploadServer" and code == 15:
+            return (
+                "VK document upload denied: VK_GROUP_TOKEN does not have the docs permission. "
+                'Create a VK community token with messages/docs rights and update VK_GROUP_TOKEN. '
+                'See README section "Настройка VK".'
+            )
+        return str(exc)
+
+    async def _upload_document(self, *, peer_id: int, path: str, title: str | None = None) -> str:
         if self.vkbottle_api is not None and DocMessagesUploader is not None:
             try:
                 uploader = DocMessagesUploader(self.vkbottle_api)
-                uploaded = await uploader.upload(path, peer_id=peer_id)
+                upload_kwargs = {"title": title} if title else {}
+                uploaded = await uploader.upload(path, peer_id=peer_id, **upload_kwargs)
                 ref = getattr(uploaded, "attachment", None) or getattr(uploaded, "attach", None)
                 if ref:
                     return str(ref)
@@ -215,7 +285,7 @@ class VKAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("vkbottle document upload failed, falling back to raw VK upload: %s", exc)
         assert self.client is not None
-        return await self.client.upload_document_raw(peer_id=peer_id, path=path)
+        return await self.client.upload_document_raw(peer_id=peer_id, path=path, title=title)
 
     async def _poll_loop(self) -> None:
         assert self.client is not None
@@ -355,9 +425,26 @@ class VKAdapter(BasePlatformAdapter):
                     if url:
                         assert self.client is not None
                         data = await self.client.download_bytes(url)
-                        media_paths.append(cache_document_from_bytes(data, title))
-                        media_types.append(doc.get("ext") or "document")
-                        inferred = MessageType.DOCUMENT
+                        raw_ext = str(doc.get("ext") or "").strip().lower()
+                        ext = f".{raw_ext}" if raw_ext and not raw_ext.startswith(".") else raw_ext
+                        if not ext:
+                            _, ext = os.path.splitext(title)
+                            ext = ext.lower()
+                        mime_type = (
+                            SUPPORTED_IMAGE_DOCUMENT_TYPES.get(ext)
+                            or SUPPORTED_DOCUMENT_TYPES.get(ext)
+                            or mimetypes.guess_type(title)[0]
+                            or "application/octet-stream"
+                        )
+                        if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES or mime_type.startswith("image/"):
+                            image_ext = ext if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES else ".jpg"
+                            media_paths.append(cache_image_from_bytes(data, image_ext))
+                            media_types.append(mime_type if mime_type.startswith("image/") else "image/jpeg")
+                            inferred = MessageType.PHOTO
+                        else:
+                            media_paths.append(cache_document_from_bytes(data, title))
+                            media_types.append(mime_type)
+                            inferred = MessageType.DOCUMENT
                 elif kind == "audio_message":
                     audio = attachment.get("audio_message") or {}
                     url = audio.get("link_ogg") or audio.get("link_mp3")

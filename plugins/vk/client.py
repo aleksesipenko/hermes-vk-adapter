@@ -154,14 +154,15 @@ class VKRestClient:
                 chunks.append(chunk)
             return b"".join(chunks)
 
-    async def upload_document_raw(self, *, peer_id: int, path: str) -> str:
+    async def upload_document_raw(self, *, peer_id: int, path: str, title: str | None = None) -> str:
         upload_server = await self.call("docs.getMessagesUploadServer", type="doc", peer_id=peer_id)
         file_path = Path(path)
-        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        upload_name = title or file_path.name
+        mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
         with file_path.open("rb") as file_handle:
             upload_response = await self.http.post(
                 upload_server["upload_url"],
-                files={"file": (file_path.name, file_handle, mime_type)},
+                files={"file": (upload_name, file_handle, mime_type)},
             )
         upload_response.raise_for_status()
         uploaded = upload_response.json()
@@ -169,7 +170,7 @@ class VKRestClient:
         if not file_token:
             raise RuntimeError(f"VK upload did not return file token: {uploaded}")
 
-        saved = await self.call("docs.save", file=file_token, title=file_path.name)
+        saved = await self.call("docs.save", file=file_token, title=upload_name)
         doc = saved.get("doc") if isinstance(saved, dict) else None
         if not isinstance(doc, dict):
             raise RuntimeError(f"Unexpected docs.save response shape: {saved}")

@@ -11,6 +11,7 @@ from httpx import Response
 from plugins.vk.adapter import (
     LongPollState,
     VKAdapter,
+    VKApiError,
     VKRestClient,
     _csv_set,
     _largest_photo_url,
@@ -141,6 +142,78 @@ async def test_raw_document_upload_flow(tmp_path: Path):
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_send_document_accepts_gateway_file_path_contract(tmp_path: Path):
+    class FakeClient:
+        uploads = []
+        messages = []
+
+        async def upload_document_raw(self, *, peer_id: int, path: str, title: str | None = None):
+            self.uploads.append({"peer_id": peer_id, "path": path, "title": title})
+            return "doc-1_99"
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+            return 123
+
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    adapter = object.__new__(VKAdapter)
+    adapter.client = FakeClient()
+    adapter.vkbottle_api = None
+
+    result = await VKAdapter.send_document(
+        adapter,
+        chat_id="987654321",
+        file_path=str(file_path),
+        caption="Report",
+        file_name="visible-report.txt",
+        metadata={"thread_id": "ignored-by-vk"},
+    )
+
+    assert result.success
+    assert result.message_id == "123"
+    assert adapter.client.uploads == [
+        {"peer_id": 987654321, "path": str(file_path), "title": "visible-report.txt"}
+    ]
+    assert adapter.client.messages == [
+        {"peer_id": 987654321, "message": "Report", "attachment": "doc-1_99"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_document_explains_missing_vk_docs_scope(tmp_path: Path):
+    class FakeClient:
+        async def upload_document_raw(self, *, peer_id: int, path: str, title: str | None = None):
+            raise VKApiError(
+                "docs.getMessagesUploadServer",
+                {
+                    "error": {
+                        "error_code": 15,
+                        "error_msg": "Access denied: no access to call this method.",
+                    }
+                },
+            )
+
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    adapter = object.__new__(VKAdapter)
+    adapter.client = FakeClient()
+    adapter.vkbottle_api = None
+
+    result = await VKAdapter.send_document(
+        adapter,
+        chat_id="987654321",
+        file_path=str(file_path),
+    )
+
+    assert not result.success
+    assert "VK_GROUP_TOKEN" in (result.error or "")
+    assert "docs" in (result.error or "")
+
+
 def test_register_provides_platform_hooks():
     class Ctx:
         kwargs = None
@@ -177,6 +250,138 @@ def test_format_message_renders_vk_plain_text():
     assert "code" in rendered
     assert "docs: https://example.com" in rendered
     assert "print('ok')" in rendered
+
+
+@pytest.mark.asyncio
+async def test_extract_audio_message_routes_voice_for_gateway_stt(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+
+    async def fake_cache_audio_from_url(url: str, ext: str = ".ogg"):
+        assert url == "https://vk.example/voice.ogg"
+        assert ext == ".ogg"
+        return "/tmp/vk-voice.ogg"
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_audio_from_url", fake_cache_audio_from_url)
+
+    media_paths, media_types, message_type = await VKAdapter._extract_media(
+        adapter,
+        {"attachments": [{"type": "audio_message", "audio_message": {"link_ogg": "https://vk.example/voice.ogg"}}]},
+    )
+
+    assert media_paths == ["/tmp/vk-voice.ogg"]
+    assert media_types == ["audio/ogg"]
+    assert message_type == MessageType.VOICE
+
+
+@pytest.mark.asyncio
+async def test_extract_photo_routes_image_for_gateway_vision(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+
+    async def fake_cache_image_from_url(url: str, ext: str = ".jpg"):
+        assert url == "https://vk.example/photo-large.jpg"
+        assert ext == ".jpg"
+        return "/tmp/vk-photo.jpg"
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", fake_cache_image_from_url)
+
+    media_paths, media_types, message_type = await VKAdapter._extract_media(
+        adapter,
+        {
+            "attachments": [
+                {
+                    "type": "photo",
+                    "photo": {
+                        "sizes": [
+                            {"width": 100, "height": 100, "url": "https://vk.example/photo-small.jpg"},
+                            {"width": 1000, "height": 1000, "url": "https://vk.example/photo-large.jpg"},
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+
+    assert media_paths == ["/tmp/vk-photo.jpg"]
+    assert media_types == ["image/jpeg"]
+    assert message_type == MessageType.PHOTO
+
+
+@pytest.mark.asyncio
+async def test_extract_image_document_routes_as_photo_for_gateway_vision(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+
+    class FakeClient:
+        async def download_bytes(self, url: str):
+            assert url == "https://vk.example/screenshot.png"
+            return b"\x89PNG\r\n\x1a\nfake"
+
+    adapter.client = FakeClient()
+
+    def fake_cache_image_from_bytes(data: bytes, ext: str = ".jpg"):
+        assert data.startswith(b"\x89PNG")
+        assert ext == ".png"
+        return "/tmp/vk-screenshot.png"
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_bytes", fake_cache_image_from_bytes)
+
+    media_paths, media_types, message_type = await VKAdapter._extract_media(
+        adapter,
+        {
+            "attachments": [
+                {
+                    "type": "doc",
+                    "doc": {
+                        "url": "https://vk.example/screenshot.png",
+                        "title": "screenshot.png",
+                        "ext": "png",
+                    },
+                }
+            ]
+        },
+    )
+
+    assert media_paths == ["/tmp/vk-screenshot.png"]
+    assert media_types == ["image/png"]
+    assert message_type == MessageType.PHOTO
+
+
+@pytest.mark.asyncio
+async def test_extract_regular_document_uses_gateway_mime_type(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+
+    class FakeClient:
+        async def download_bytes(self, url: str):
+            assert url == "https://vk.example/report.pdf"
+            return b"%PDF-1.7"
+
+    adapter.client = FakeClient()
+
+    def fake_cache_document_from_bytes(data: bytes, filename: str):
+        assert data.startswith(b"%PDF")
+        assert filename == "report.pdf"
+        return "/tmp/report.pdf"
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_document_from_bytes", fake_cache_document_from_bytes)
+
+    media_paths, media_types, message_type = await VKAdapter._extract_media(
+        adapter,
+        {
+            "attachments": [
+                {
+                    "type": "doc",
+                    "doc": {
+                        "url": "https://vk.example/report.pdf",
+                        "title": "report.pdf",
+                        "ext": "pdf",
+                    },
+                }
+            ]
+        },
+    )
+
+    assert media_paths == ["/tmp/report.pdf"]
+    assert media_types == ["application/pdf"]
+    assert message_type == MessageType.DOCUMENT
 
 
 @pytest.mark.asyncio
