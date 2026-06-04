@@ -16,6 +16,13 @@ from .utils import DEFAULT_API_VERSION, VK_API_BASE, _vk_attachment_ref
 
 logger = logging.getLogger(__name__)
 
+VK_MESSAGE_PHOTO_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+}
+
 
 class VKApiError(RuntimeError):
     def __init__(self, method: str, payload: dict[str, Any]):
@@ -177,4 +184,33 @@ class VKRestClient:
         ref = _vk_attachment_ref("doc", doc)
         if not ref:
             raise RuntimeError(f"Cannot build VK doc attachment ref from: {doc}")
+        return ref
+
+    async def upload_photo_message_raw(self, *, peer_id: int, path: str) -> str:
+        upload_server = await self.call("photos.getMessagesUploadServer", peer_id=peer_id)
+        file_path = Path(path)
+        upload_name = file_path.name
+        mime_type = VK_MESSAGE_PHOTO_MIME_TYPES.get(file_path.suffix.lower())
+        if mime_type is None:
+            mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+        with file_path.open("rb") as file_handle:
+            upload_response = await self.http.post(
+                upload_server["upload_url"],
+                files={"photo": (upload_name, file_handle, mime_type)},
+            )
+        upload_response.raise_for_status()
+        uploaded = upload_response.json()
+        photo = uploaded.get("photo")
+        server = uploaded.get("server")
+        upload_hash = uploaded.get("hash")
+        if photo is None or server is None or not upload_hash:
+            raise RuntimeError(f"VK photo upload did not return save parameters: {uploaded}")
+
+        saved = await self.call("photos.saveMessagesPhoto", photo=photo, server=server, hash=upload_hash)
+        photo_obj = saved[0] if isinstance(saved, list) and saved else None
+        if not isinstance(photo_obj, dict):
+            raise RuntimeError(f"Unexpected photos.saveMessagesPhoto response shape: {saved}")
+        ref = _vk_attachment_ref("photo", photo_obj)
+        if not ref:
+            raise RuntimeError(f"Cannot build VK photo attachment ref from: {photo_obj}")
         return ref

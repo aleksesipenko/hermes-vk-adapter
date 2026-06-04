@@ -9,6 +9,8 @@ import mimetypes
 import os
 from typing import Any, Optional
 
+import httpx
+
 try:
     from vkbottle import API as VKBottleAPI
     from vkbottle import DocMessagesUploader
@@ -31,7 +33,7 @@ from gateway.platforms.base import (
 )
 
 from .callbacks import VKCallbackRouter
-from .client import LongPollState, VKApiError, VKRestClient
+from .client import LongPollState, VKApiError, VKRestClient, VK_MESSAGE_PHOTO_MIME_TYPES
 from .formatting import render_vk_plain_text
 from .keyboards import VKKeyboardFactory, model_picker_provider_text
 from .utils import (
@@ -186,6 +188,65 @@ class VKAdapter(BasePlatformAdapter):
             metadata=metadata,
             **kwargs,
         )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        if not self.client:
+            return SendResult(success=False, error="VK adapter is not connected", retryable=True)
+        peer_id = _safe_int(chat_id)
+        if not peer_id:
+            return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
+        if not os.path.exists(image_path):
+            return SendResult(success=False, error=f"VK image path does not exist: {image_path}")
+        if os.path.splitext(image_path)[1].lower() not in VK_MESSAGE_PHOTO_MIME_TYPES:
+            return await self.send_document(
+                chat_id=chat_id,
+                file_path=image_path,
+                caption=caption,
+                file_name=os.path.basename(image_path),
+                reply_to=reply_to,
+                metadata=metadata,
+                **kwargs,
+            )
+        try:
+            ref = await self.client.upload_photo_message_raw(peer_id=peer_id, path=image_path)
+            send_kwargs: dict[str, Any] = {"peer_id": peer_id, "message": caption or "", "attachment": ref}
+            if reply_to:
+                send_kwargs["reply_to"] = reply_to
+            try:
+                response = await self.client.send_message(**send_kwargs)
+            except VKApiError as exc:
+                if not reply_to or "reply_to" not in str(exc):
+                    raise
+                logger.info("VK photo reply_to rejected for peer_id=%s; retrying without reply_to", peer_id)
+                response = await self.client.send_message(
+                    peer_id=peer_id,
+                    message=caption or "",
+                    attachment=ref,
+                )
+            return SendResult(success=True, message_id=str(response))
+        except (VKApiError, RuntimeError, OSError, ValueError, httpx.HTTPError) as exc:
+            logger.warning(
+                "VK native photo send failed peer_id=%s; trying document fallback: %s",
+                peer_id,
+                exc,
+            )
+            return await self.send_document(
+                chat_id=chat_id,
+                file_path=image_path,
+                caption=caption,
+                file_name=os.path.basename(image_path),
+                reply_to=reply_to,
+                metadata=metadata,
+                **kwargs,
+            )
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         peer_id = _safe_int(chat_id)

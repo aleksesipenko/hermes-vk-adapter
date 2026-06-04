@@ -6,7 +6,7 @@ description: Адаптер VK-сообщества через Long Poll для 
 author: Alex / Hermes VK Adapter
 requires_env:
   - name: VK_GROUP_TOKEN
-    description: 'Токен VK-сообщества с правами messages/manage/docs. Это не личный токен VK-пользователя. Перед вводом прочитай раздел README "Настройка VK".'
+    description: 'Токен VK-сообщества с правами messages/manage/docs/photos. Это не личный токен VK-пользователя. Перед вводом прочитай раздел README "Настройка VK".'
     prompt: Токен VK-сообщества
     url: https://github.com/aleksesipenko/hermes-vk-adapter#readme
     secret: true
