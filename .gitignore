@@ -1,0 +1,38 @@
+# Secrets and local runtime state
+.env
+.env.*
+!.env.example
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Hermes / local smoke artifacts
+.hermes/
+.hermes-local/
+media-cache/
+tmp/
+vendor/hermes-agent/
+
+# Local-only operator/development context
+AGENTS.md
+.githooks/
+docs/
+scripts/install-local-plugin.sh
+plugins/vk/README.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Codex scratch folders from the initial project shell
+work/
+outputs/

@@ -1,0 +1,56 @@
+name: vk
+label: VK
+kind: platform
+version: 0.1.0
+description: VK community Long Poll adapter for Hermes Agent.
+author: Alex / Hermes local plugin
+requires_env:
+  - name: VK_GROUP_TOKEN
+    description: 'VK community access token with messages/docs permissions. This is not a personal VK user token. Read README section "Настройка VK" before pasting a value.'
+    prompt: VK community access token
+    url: https://github.com/aleksesipenko/hermes-vk-adapter#readme
+    secret: true
+    password: true
+  - name: VK_GROUP_ID
+    description: 'Positive numeric VK community id, without the leading minus. Example: club123456789 -> 123456789. Read README section "Настройка VK".'
+    prompt: VK community numeric id
+    url: https://github.com/aleksesipenko/hermes-vk-adapter#readme
+    secret: false
+    password: false
+optional_env:
+  - name: VK_API_VERSION
+    description: VK API version, default 5.199
+    prompt: VK API version
+    password: false
+  - name: VK_ALLOWED_USERS
+    description: Comma-separated numeric VK user ids allowed to talk to Hermes
+    prompt: Allowed VK user ids
+    password: false
+  - name: VK_ALLOW_ALL_USERS
+    description: Set true only for public testing
+    prompt: Allow all VK users
+    password: false
+  - name: VK_HOME_PEER_ID
+    description: 'Default VK peer_id for cron/proactive delivery. For DM it is usually your numeric VK user id; for group chats inspect gateway logs.'
+    prompt: Home VK peer_id
+    password: false
+  - name: VK_REQUIRE_MENTION
+    description: Require mention or reply activation for ordinary group chat text
+    prompt: Require mention in group chats
+    password: false
+  - name: VK_COMMAND_KEYBOARD
+    description: Show persistent VK command keyboard on normal text responses
+    prompt: Enable command keyboard
+    password: false
+  - name: VK_POLL_WAIT_SECONDS
+    description: VK Long Poll wait seconds
+    prompt: Poll wait seconds
+    password: false
+  - name: VK_MAX_MESSAGE_LENGTH
+    description: Safe outbound message chunk size
+    prompt: Max message length
+    password: false
+  - name: VK_DEBUG_UPDATES
+    description: Log raw Long Poll updates for diagnostics
+    prompt: Debug VK updates
+    password: false
