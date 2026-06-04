@@ -2,64 +2,64 @@ name: vk
 label: VK
 kind: platform
 version: 0.1.0
-description: VK community Long Poll adapter for Hermes Agent.
+description: Адаптер VK-сообщества через Long Poll для Hermes Agent.
 author: Alex / Hermes VK Adapter
 requires_env:
   - name: VK_GROUP_TOKEN
-    description: 'VK community access token with messages/docs permissions. This is not a personal VK user token. Read README section "Настройка VK" before pasting a value.'
-    prompt: VK community access token
+    description: 'Токен VK-сообщества с правами messages/docs. Это не личный токен VK-пользователя. Перед вводом прочитай раздел README "Настройка VK".'
+    prompt: Токен VK-сообщества
     url: https://github.com/aleksesipenko/hermes-vk-adapter#readme
     secret: true
     password: true
   - name: VK_GROUP_ID
-    description: 'Positive numeric VK community id, without the leading minus. Example: club123456789 -> 123456789. Read README section "Настройка VK".'
-    prompt: VK community numeric id
+    description: 'Положительный числовой id VK-сообщества, без минуса. Пример: club123456789 -> 123456789. Подробности в README, раздел "Настройка VK".'
+    prompt: Числовой id VK-сообщества
     url: https://github.com/aleksesipenko/hermes-vk-adapter#readme
     secret: false
     password: false
 optional_env:
   - name: VK_API_VERSION
-    description: VK API version, default 5.199
-    prompt: VK API version
+    description: Версия VK API, по умолчанию 5.199
+    prompt: Версия VK API
     secret: false
     password: false
   - name: VK_ALLOWED_USERS
-    description: Comma-separated numeric VK user ids allowed to talk to Hermes
-    prompt: Allowed VK user ids
+    description: Числовые VK user id через запятую; только эти пользователи смогут писать Hermes
+    prompt: Разрешённые VK user id
     secret: false
     password: false
   - name: VK_ALLOW_ALL_USERS
-    description: Set true only for public testing
-    prompt: Allow all VK users
+    description: Поставь true только для публичного тестирования
+    prompt: Разрешить всех VK-пользователей
     secret: false
     password: false
   - name: VK_HOME_PEER_ID
-    description: 'Default VK peer_id for cron/proactive delivery. For DM it is usually your numeric VK user id; for group chats inspect gateway logs.'
-    prompt: Home VK peer_id
+    description: 'VK peer_id для cron/proactive-доставки. Для DM обычно совпадает с твоим числовым VK user id; для беседы смотри логи gateway.'
+    prompt: Домашний VK peer_id
     secret: false
     password: false
   - name: VK_REQUIRE_MENTION
-    description: Require mention or reply activation for ordinary group chat text
-    prompt: Require mention in group chats
+    description: Требовать mention/reply activation для обычного текста в групповых беседах
+    prompt: Требовать mention в беседах
     secret: false
     password: false
   - name: VK_COMMAND_KEYBOARD
-    description: Show persistent VK command keyboard on normal text responses
-    prompt: Enable command keyboard
+    description: Показывать постоянную VK-клавиатуру команд в обычных текстовых ответах
+    prompt: Включить клавиатуру команд
     secret: false
     password: false
   - name: VK_POLL_WAIT_SECONDS
-    description: VK Long Poll wait seconds
-    prompt: Poll wait seconds
+    description: Время ожидания VK Long Poll в секундах
+    prompt: Таймаут Long Poll в секундах
     secret: false
     password: false
   - name: VK_MAX_MESSAGE_LENGTH
-    description: Safe outbound message chunk size
-    prompt: Max message length
+    description: Безопасный размер фрагмента исходящего сообщения
+    prompt: Максимальная длина сообщения
     secret: false
     password: false
   - name: VK_DEBUG_UPDATES
-    description: Log raw Long Poll updates for diagnostics
-    prompt: Debug VK updates
+    description: Логировать raw Long Poll updates для диагностики
+    prompt: Диагностировать VK updates
     secret: false
     password: false

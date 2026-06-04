@@ -1,28 +1,28 @@
-# Hermes VK Adapter Installed
+# Hermes VK Adapter установлен
 
-The VK platform plugin is installed and enabled.
+Платформенный плагин VK установлен и включён.
 
-Read the Russian setup guide before starting the gateway:
+Перед запуском gateway прочитай инструкцию по настройке:
 
 https://github.com/aleksesipenko/hermes-vk-adapter#readme
 
-Next checks:
+Следующие проверки:
 
 ```bash
 hermes plugins list
 hermes gateway status
 ```
 
-VK setup checklist:
+Чеклист настройки VK:
 
-1. Use a VK community access token, not a personal VK user token.
-2. Enable community messages.
-3. Enable Long Poll API events: `message_new` and `message_event`.
-4. Enable Bot features / Chat bot feature in the VK community settings.
-5. Set `VK_ALLOWED_USERS` to the numeric VK user ids allowed to talk to Hermes.
-6. Set `VK_HOME_PEER_ID` after the first Long Poll message reveals the real peer id.
+1. Используй токен VK-сообщества, не личный токен VK-пользователя.
+2. Включи сообщения сообщества.
+3. Включи события Long Poll API: `message_new` и `message_event`.
+4. Включи функции бота / чат-бота в настройках VK-сообщества.
+5. Заполни `VK_ALLOWED_USERS`: числовые VK user id пользователей, которым можно писать Hermes.
+6. Заполни `VK_HOME_PEER_ID` после первого Long Poll сообщения, когда в логах gateway появится настоящий peer id.
 
-Restart the gateway after changing plugin or environment settings:
+После изменения настроек плагина или окружения перезапусти gateway:
 
 ```bash
 hermes gateway restart

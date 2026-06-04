@@ -11,7 +11,7 @@ say() {
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    printf 'error: required command not found: %s\n' "$1" >&2
+    printf 'ошибка: обязательная команда не найдена: %s\n' "$1" >&2
     exit 1
   fi
 }
@@ -33,7 +33,7 @@ pipx_has_hermes_agent() {
 }
 
 install_python_deps() {
-  say "[1/4] Installing VK Python dependencies in the Hermes runtime"
+  say "[1/4] Ставлю Python-зависимости VK в окружение Hermes"
 
   if pipx_has_hermes_agent; then
     pipx inject hermes-agent "${PY_DEPS[@]}"
@@ -50,14 +50,14 @@ install_python_deps() {
     return
   fi
 
-  printf 'error: could not locate the Python environment that runs hermes.\n' >&2
-  printf 'Install dependencies manually, then rerun:\n' >&2
+  printf 'ошибка: не удалось найти Python-окружение, из которого запускается hermes.\n' >&2
+  printf 'Поставь зависимости вручную и запусти скрипт ещё раз:\n' >&2
   printf '  python -m pip install --upgrade %s\n' "${PY_DEPS[*]}" >&2
   exit 1
 }
 
 install_plugin() {
-  say "[2/4] Installing Hermes VK plugin from ${REPO}"
+  say "[2/4] Ставлю плагин Hermes VK из ${REPO}"
   local install_args
   install_args=(plugins install "$REPO" --enable)
   if [ -d "${HERMES_HOME:-$HOME/.hermes}/plugins/${PLUGIN_NAME}" ]; then
@@ -69,7 +69,7 @@ install_plugin() {
   fi
 
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    say "Retrying plugin install without GITHUB_TOKEN"
+    say "Повторяю установку без GITHUB_TOKEN"
     env -u GITHUB_TOKEN hermes "${install_args[@]}"
     return
   fi
@@ -78,11 +78,11 @@ install_plugin() {
 }
 
 verify_install() {
-  say "[3/4] Verifying plugin list"
+  say "[3/4] Проверяю список плагинов"
   hermes plugins list
 
-  say "[4/4] Next gateway checks"
-  printf 'Run:\n'
+  say "[4/4] Следующие проверки gateway"
+  printf 'Запусти:\n'
   printf '  hermes gateway status\n'
   printf '  hermes gateway restart\n'
 }
