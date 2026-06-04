@@ -73,6 +73,32 @@ async def test_raw_photo_upload_flow_for_vk_supported_formats(
 
 
 @pytest.mark.asyncio
+@respx.mock
+async def test_raw_photo_upload_rejects_empty_vk_photo_payload(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(_image_bytes(".png"))
+
+    client = VKRestClient("token", group_id=123456789, api_version="5.199")
+    respx.post("https://api.vk.com/method/photos.getMessagesUploadServer").mock(
+        return_value=Response(200, json={"response": {"upload_url": "https://upload.example/photo"}})
+    )
+    respx.post("https://upload.example/photo").mock(
+        return_value=Response(200, json={"server": 231331, "photo": "", "hash": "hash-token"})
+    )
+    save = respx.post("https://api.vk.com/method/photos.saveMessagesPhoto").mock(
+        return_value=Response(200, json={"response": []})
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="did not return save parameters"):
+            await client.upload_photo_message_raw(peer_id=987654321, path=str(image_path))
+    finally:
+        await client.close()
+
+    assert not save.called
+
+
+@pytest.mark.asyncio
 async def test_send_image_file_uses_vk_native_photo_upload(tmp_path: Path) -> None:
     class FakeClient:
         def __init__(self) -> None:

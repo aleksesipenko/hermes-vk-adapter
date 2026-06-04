@@ -203,7 +203,7 @@ class VKRestClient:
         photo = uploaded.get("photo")
         server = uploaded.get("server")
         upload_hash = uploaded.get("hash")
-        if photo is None or server is None or not upload_hash:
+        if not photo or server is None or not upload_hash:
             raise RuntimeError(f"VK photo upload did not return save parameters: {uploaded}")
 
         saved = await self.call("photos.saveMessagesPhoto", photo=photo, server=server, hash=upload_hash)
