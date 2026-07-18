@@ -32,6 +32,14 @@ def test_truthy_csv_and_safe_int_helpers():
     assert _safe_int("nope", default=7) == 7
 
 
+def test_connect_accepts_gateway_reconnect_flag():
+    import inspect
+
+    signature = inspect.signature(VKAdapter.connect)
+    assert "is_reconnect" in signature.parameters
+    assert signature.parameters["is_reconnect"].default is False
+
+
 def test_attachment_ref_includes_access_key_when_present():
     assert _vk_attachment_ref("doc", {"owner_id": -1, "id": 2}) == "doc-1_2"
     assert (

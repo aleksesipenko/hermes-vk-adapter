@@ -84,7 +84,7 @@ class VKAdapter(BasePlatformAdapter):
         self._model_picker_state: dict[str, dict[str, Any]] = {}
         self._keyboards = VKKeyboardFactory()
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token or not self.group_id:
             self._set_fatal_error(
                 "vk_config_missing",
