@@ -226,6 +226,25 @@ async def test_backoff_resets_after_a_successful_poll():
     assert delays[2] <= delays[0] * 1.5  # back to the first-failure delay
 
 
+def test_backoff_survives_an_outage_longer_than_the_exponent_can_hold():
+    """A long outage must keep backing off, not kill the poll loop.
+
+    The delay is capped at POLL_BACKOFF_MAX, but the *exponent* it is derived
+    from grows once per consecutive failure. Past ~1024 failures -- a night of
+    downtime at the 60s ceiling -- 2**failures no longer fits in a float, and
+    the OverflowError escapes the very handler that exists to keep the loop
+    alive, so the adapter stops polling exactly when it should be waiting the
+    outage out.
+    """
+    adapter = make_adapter()
+
+    for failures in (1, 2, 1025, 100_000):
+        adapter._poll_failures = failures
+        delay = VKAdapter._poll_backoff_delay(adapter)
+
+        assert 0 < delay <= VKAdapter.POLL_BACKOFF_MAX
+
+
 # ── documented `failed` codes ─────────────────────────────────────────────
 
 

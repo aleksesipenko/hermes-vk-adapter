@@ -62,6 +62,9 @@ class VKAdapter(BasePlatformAdapter):
     #: Bounded backoff between failed Long Poll attempts.
     POLL_BACKOFF_BASE = 1.0
     POLL_BACKOFF_MAX = 60.0
+    #: 2**16s is already far past POLL_BACKOFF_MAX; clamping here keeps the
+    #: doubling from outgrowing a float during a multi-hour outage.
+    POLL_BACKOFF_MAX_EXPONENT = 16
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("vk"))
@@ -549,7 +552,11 @@ class VKAdapter(BasePlatformAdapter):
         await self._poll_sleep(self._poll_backoff_delay())
 
     def _poll_backoff_delay(self) -> float:
-        exponent = max(0, self._poll_failures - 1)
+        # The exponent is clamped, not just the resulting delay: an outage that
+        # outlives ~1024 consecutive failures would otherwise make 2**failures
+        # too large to convert to a float, and the OverflowError would escape
+        # the handler that keeps the poll loop alive across an outage.
+        exponent = min(max(0, self._poll_failures - 1), self.POLL_BACKOFF_MAX_EXPONENT)
         base = min(self.POLL_BACKOFF_BASE * (2**exponent), self.POLL_BACKOFF_MAX)
         return min(base * (1.0 + random.random() * 0.25), self.POLL_BACKOFF_MAX)
 
