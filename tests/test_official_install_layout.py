@@ -5,7 +5,11 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 from hermes_cli.plugins import PluginManager
+
+# Plugin discovery is a Hermes CLI contract.
+pytestmark = pytest.mark.hermes_contract
 
 
 def test_repo_root_is_discovered_as_official_hermes_plugin(tmp_path: Path) -> None:

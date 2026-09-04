@@ -8,6 +8,9 @@ from httpx import Response
 
 from plugins.vk.adapter import VKAdapter, VKApiError, VKRestClient
 
+# Importing the adapter requires the real Hermes contract.
+pytestmark = pytest.mark.hermes_contract
+
 
 def _image_bytes(suffix: str) -> bytes:
     match suffix:

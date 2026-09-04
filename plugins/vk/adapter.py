@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -25,17 +26,28 @@ from gateway.platforms.base import (
 )
 
 from .callbacks import VKCallbackRouter
-from .client import VK_MESSAGE_PHOTO_MIME_TYPES, LongPollState, VKApiError, VKRestClient
+from .client import (
+    VK_MESSAGE_PHOTO_MIME_TYPES,
+    LongPollState,
+    VKApiError,
+    VKRestClient,
+    classify_vk_error_kind,
+    is_retryable,
+)
 from .formatting import render_vk_plain_text
 from .keyboards import VKKeyboardFactory, model_picker_provider_text
+from .state import BoundedTTLCache
 from .utils import (
     DEFAULT_API_VERSION,
     DEFAULT_MAX_MESSAGE_LENGTH,
     DEFAULT_POLL_WAIT_SECONDS,
+    OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
+    OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
     _csv_set,
     _largest_photo_url,
     _safe_int,
     _truthy,
+    redact_secrets,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +91,10 @@ class VKAdapter(BasePlatformAdapter):
         self._clarify_state: dict[str, str] = {}
         self._model_picker_state: dict[str, dict[str, Any]] = {}
         self._keyboards = VKKeyboardFactory()
+        self._outbound_random_ids = BoundedTTLCache(
+            max_entries=OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
+            ttl_seconds=OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token or not self.group_id:
@@ -133,6 +149,7 @@ class VKAdapter(BasePlatformAdapter):
             chunks = self._chunk_text(content or "") or [""]
             sent_ids: list[str] = []
             for index, chunk in enumerate(chunks):
+                rendered = self.format_message(chunk)
                 current_reply_to = reply_to if index == 0 else None
                 first_chunk = index == 0
                 keyboard = (
@@ -140,12 +157,14 @@ class VKAdapter(BasePlatformAdapter):
                     if self.command_keyboard_enabled and first_chunk
                     else None
                 )
+                random_id = self._chunk_random_id(peer_id, index, rendered)
                 try:
                     response = await self.client.send_message(
                         peer_id=peer_id,
-                        message=self.format_message(chunk),
+                        message=rendered,
                         reply_to=current_reply_to,
                         keyboard=keyboard,
+                        random_id=random_id,
                     )
                 except VKApiError as exc:
                     if not current_reply_to or "reply_to" not in str(exc):
@@ -153,10 +172,13 @@ class VKAdapter(BasePlatformAdapter):
                     logger.info(
                         "VK reply_to rejected for peer_id=%s; retrying without reply_to", peer_id
                     )
+                    # VK rejected the request outright, so nothing was
+                    # delivered: the same random_id is still the right key.
                     response = await self.client.send_message(
                         peer_id=peer_id,
-                        message=self.format_message(chunk),
+                        message=rendered,
                         keyboard=keyboard,
+                        random_id=random_id,
                     )
                 sent_ids.append(str(response))
             return SendResult(
@@ -166,7 +188,7 @@ class VKAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("VK send failed peer_id=%s", peer_id)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
     async def send_document(
         self,
@@ -321,20 +343,14 @@ class VKAdapter(BasePlatformAdapter):
                 logger.exception("VK media send failed peer_id=%s", peer_id)
             else:
                 logger.warning("VK media send failed peer_id=%s: %s", peer_id, error)
-            return SendResult(
-                success=False,
-                error=error,
-                retryable=self._is_retryable(exc),
-            )
+            return self._failed_send(exc, error=error)
         except Exception as exc:
             logger.exception("VK media send failed peer_id=%s", peer_id)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
     @staticmethod
     def _media_vk_api_error(exc: VKApiError) -> str:
-        error = exc.payload.get("error")
-        code = error.get("error_code") if isinstance(error, dict) else None
-        if exc.method == "docs.getMessagesUploadServer" and code == 15:
+        if exc.method == "docs.getMessagesUploadServer" and exc.code == 15:
             return (
                 "VK document upload denied: VK_GROUP_TOKEN does not have the docs permission. "
                 'Create a VK community token with messages/docs rights and update VK_GROUP_TOKEN. '
@@ -608,10 +624,31 @@ class VKAdapter(BasePlatformAdapter):
             remaining = remaining[len(chunk) :].strip()
         return chunks
 
-    def _is_retryable(self, exc: Exception) -> bool:
-        text = str(exc).lower()
-        markers = ("timeout", "temporarily", "connection", "429", "5xx")
-        return any(marker in text for marker in markers)
+    def _chunk_random_id(self, peer_id: int, index: int, rendered: str) -> int:
+        """A ``random_id`` that is stable across retries of one logical chunk.
+
+        VK deduplicates ``messages.send`` by ``random_id``, so a retry -- ours
+        after a timeout, or the gateway's after a ``retryable`` SendResult --
+        must present the same value or it becomes a second visible message.
+        The id is cached under a content key for a short window: long enough to
+        cover any retry of *this* send, short enough that the user genuinely
+        repeating a message later still gets a fresh id instead of silently
+        colliding with the earlier one.
+        """
+        assert self.client is not None
+        digest = hashlib.blake2b(rendered.encode("utf-8"), digest_size=16).hexdigest()
+        key = (peer_id, index, digest)
+        return self._outbound_random_ids.setdefault(key, self.client.new_random_id)
+
+    @staticmethod
+    def _failed_send(exc: BaseException, *, error: str | None = None) -> SendResult:
+        """Build a failed SendResult with a machine-readable classification."""
+        return SendResult(
+            success=False,
+            error=error if error is not None else redact_secrets(exc),
+            retryable=is_retryable(exc),
+            error_kind=classify_vk_error_kind(exc),
+        )
 
     async def send_exec_approval(
         self,
@@ -640,7 +677,7 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
             self._approval_state.pop(approval_id, None)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
     async def send_slash_confirm(
         self,
@@ -666,7 +703,7 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
             self._slash_confirm_state.pop(confirm_id, None)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
     async def send_clarify(
         self,
@@ -709,7 +746,7 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
             self._clarify_state.pop(clarify_id, None)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
     async def send_model_picker(
         self,
@@ -743,7 +780,7 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
             self._model_picker_state.pop(str(peer_id), None)
-            return SendResult(success=False, error=str(exc), retryable=self._is_retryable(exc))
+            return self._failed_send(exc)
 
 
 async def _standalone_send(

@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 DEFAULT_API_VERSION = "5.199"
 DEFAULT_POLL_WAIT_SECONDS = 25
 DEFAULT_MAX_MESSAGE_LENGTH = 8500
 VK_API_BASE = "https://api.vk.com/method"
+
+# Longest text VK accepts in one messages.send call.
+VK_MESSAGE_SEND_LIMIT = 9000
+# messages.edit has its own, much smaller cap.
+VK_MESSAGE_EDIT_LIMIT = 4096
+
+MAX_ERROR_MESSAGE_CHARS = 300
+
+# A VK community token is a long opaque run of hex.  Anything of that shape in
+# text headed for a log or an error string is assumed to be a credential.
+_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
+
+
+def redact_secrets(text: Any) -> str:
+    """Mask token-shaped runs so credentials cannot reach logs or errors."""
+    if not text:
+        return ""
+    return _SECRET_RUN_RE.sub("***", str(text))
 
 
 def _truthy(value: Any) -> bool:
@@ -54,3 +73,9 @@ def _largest_photo_url(photo: dict[str, Any]) -> str | None:
     if not candidates:
         return None
     return max(candidates, key=lambda item: item[0])[1]
+
+
+# Outbound idempotency: how many recent (peer, chunk, content) keys to remember
+# and for how long a retry should resolve to the same VK random_id.
+OUTBOUND_IDEMPOTENCY_MAX_ENTRIES = 512
+OUTBOUND_IDEMPOTENCY_TTL_SECONDS = 120.0

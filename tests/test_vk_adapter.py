@@ -22,6 +22,9 @@ from plugins.vk.adapter import (
 )
 from plugins.vk.utils import _vk_attachment_ref
 
+# Importing the adapter requires the real Hermes contract.
+pytestmark = pytest.mark.hermes_contract
+
 
 def test_truthy_csv_and_safe_int_helpers():
     assert _truthy("true")
@@ -797,3 +800,153 @@ async def test_model_picker_back_and_close_edit_picker_message():
     assert "closed" in adapter.client.edits[-1]["message"].lower()
     assert "987654321" not in adapter._model_picker_state
     assert adapter.client.answers == []
+
+
+# ── outbound idempotency and typed failures (Task 3) ──────────────────────
+
+
+def _idempotent_adapter():
+    """An adapter wired just enough to exercise send()."""
+    from plugins.vk.state import BoundedTTLCache
+
+    class FakeClient:
+        def __init__(self):
+            self.sends = []
+            self._next = 0
+
+        def new_random_id(self):
+            self._next += 1
+            return self._next
+
+        async def send_message(self, **kwargs):
+            self.sends.append(kwargs)
+            return 100 + len(self.sends)
+
+    adapter = object.__new__(VKAdapter)
+    adapter.client = FakeClient()
+    adapter.max_message_length = 9000
+    adapter.command_keyboard_enabled = False
+    adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_repeated_send_of_identical_content_reuses_one_random_id():
+    """A gateway-level retry must not become a second visible VK message."""
+    adapter = _idempotent_adapter()
+
+    first = await VKAdapter.send(adapter, chat_id="987654321", content="same text")
+    second = await VKAdapter.send(adapter, chat_id="987654321", content="same text")
+
+    assert first.success and second.success
+    random_ids = [call["random_id"] for call in adapter.client.sends]
+    assert len(random_ids) == 2
+    assert random_ids[0] == random_ids[1]
+    assert random_ids[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_distinct_content_and_distinct_peers_get_distinct_random_ids():
+    adapter = _idempotent_adapter()
+
+    await VKAdapter.send(adapter, chat_id="987654321", content="alpha")
+    await VKAdapter.send(adapter, chat_id="987654321", content="beta")
+    await VKAdapter.send(adapter, chat_id="123123123", content="alpha")
+
+    random_ids = [call["random_id"] for call in adapter.client.sends]
+    assert len(set(random_ids)) == 3
+
+
+@pytest.mark.asyncio
+async def test_each_chunk_of_one_message_gets_its_own_random_id():
+    adapter = _idempotent_adapter()
+    adapter.max_message_length = 10
+
+    await VKAdapter.send(adapter, chat_id="987654321", content="hello world hello world")
+
+    random_ids = [call["random_id"] for call in adapter.client.sends]
+    assert len(random_ids) > 1
+    assert len(set(random_ids)) == len(random_ids)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_fallback_keeps_the_same_random_id():
+    """VK rejected the request, so nothing was delivered under that id."""
+    adapter = _idempotent_adapter()
+
+    class RejectingClient(type(adapter.client)):
+        async def send_message(self, **kwargs):
+            self.sends.append(kwargs)
+            if kwargs.get("reply_to"):
+                raise VKApiError(
+                    "messages.send",
+                    {"error": {"error_code": 100, "error_msg": "invalid reply_to"}},
+                )
+            return 777
+
+    adapter.client = RejectingClient()
+
+    result = await VKAdapter.send(
+        adapter, chat_id="987654321", content="text", reply_to="42"
+    )
+
+    assert result.success
+    random_ids = [call["random_id"] for call in adapter.client.sends]
+    assert len(random_ids) == 2
+    assert random_ids[0] == random_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_permanent_vk_failure_is_non_retryable_and_classified():
+    adapter = _idempotent_adapter()
+
+    class ForbiddenClient(type(adapter.client)):
+        async def send_message(self, **kwargs):
+            raise VKApiError(
+                "messages.send",
+                {"error": {"error_code": 901, "error_msg": "no permission"}},
+            )
+
+    adapter.client = ForbiddenClient()
+
+    result = await VKAdapter.send(adapter, chat_id="987654321", content="text")
+
+    assert not result.success
+    assert result.retryable is False
+    assert result.error_kind == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_retryable_and_classified_transient():
+    import httpx
+
+    adapter = _idempotent_adapter()
+
+    class FlakyClient(type(adapter.client)):
+        async def send_message(self, **kwargs):
+            raise httpx.ConnectError("connection refused")
+
+    adapter.client = FlakyClient()
+
+    result = await VKAdapter.send(adapter, chat_id="987654321", content="text")
+
+    assert not result.success
+    assert result.retryable is True
+    assert result.error_kind == "transient"
+
+
+@pytest.mark.asyncio
+async def test_send_failure_message_never_carries_a_token():
+    adapter = _idempotent_adapter()
+    token = "b" * 85
+
+    class LeakyClient(type(adapter.client)):
+        async def send_message(self, **kwargs):
+            raise RuntimeError(f"boom access_token={token}")
+
+    adapter.client = LeakyClient()
+
+    result = await VKAdapter.send(adapter, chat_id="987654321", content="text")
+
+    assert not result.success
+    assert token not in (result.error or "")

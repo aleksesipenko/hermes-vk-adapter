@@ -7,13 +7,21 @@ import json
 import logging
 import mimetypes
 import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from .utils import DEFAULT_API_VERSION, VK_API_BASE, _vk_attachment_ref
+from .utils import (
+    DEFAULT_API_VERSION,
+    MAX_ERROR_MESSAGE_CHARS,
+    VK_API_BASE,
+    _safe_int,
+    _vk_attachment_ref,
+    redact_secrets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,19 +32,81 @@ VK_MESSAGE_PHOTO_MIME_TYPES = {
     ".gif": "image/gif",
 }
 
+# VK ``random_id`` is a signed 32-bit integer and must be non-zero for the
+# deduplication VK performs on messages.send.
+VK_RANDOM_ID_MAX = 2_147_483_647
+
+# ── Error classification ──────────────────────────────────────────────────
+#
+# Deliberately small and conservative.  Only codes whose meaning is stable and
+# unambiguous are listed; anything else falls through to "unknown", which is
+# never auto-retried.  Getting this wrong in the permissive direction is the
+# dangerous one, and even then a retry reuses the same ``random_id``, so VK
+# still collapses a duplicate send.
+
+#: VK codes worth another attempt: a transient server-side condition.
+VK_RETRYABLE_ERROR_CODES = frozenset({1, 6, 10})
+
+#: VK code -> Hermes ``SendResult.error_kind`` (gateway/platforms/base.py).
+VK_ERROR_KINDS: dict[int, str] = {
+    1: "transient",  # Unknown error occurred
+    5: "forbidden",  # User authorization failed
+    6: "rate_limited",  # Too many requests per second
+    9: "rate_limited",  # Flood control
+    10: "transient",  # Internal server error
+    15: "forbidden",  # Access denied
+    100: "unknown",  # Missing or invalid parameter
+    113: "not_found",  # Invalid user id
+    901: "forbidden",  # Cannot message this user without permission
+    902: "forbidden",  # Blocked by the recipient's privacy settings
+    914: "too_long",  # Message is too long
+}
+
 
 class VKApiError(RuntimeError):
-    def __init__(self, method: str, payload: dict[str, Any]):
-        error = payload.get("error") or payload
-        self.method = method
-        self.payload = payload
-        if isinstance(error, dict):
-            code = error.get("error_code", "unknown")
-            message = error.get("error_msg", str(error))
-        else:
-            code = "unknown"
-            message = str(error)
-        super().__init__(f"VK API error in {method}: {code} {message}")
+    """A VK API failure with a validated code and a credential-safe message.
+
+    The raw response is intentionally **not** retained: VK echoes the request
+    back in ``error.request_params``, which carries ``access_token`` and the
+    outgoing message body.  Keeping it would put both into any log line that
+    formats the exception.
+    """
+
+    def __init__(self, method: str, payload: Any):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            error = {}
+        self.method = str(method)
+        self.code: int = _safe_int(error.get("error_code"), 0)
+        self.message: str = redact_secrets(error.get("error_msg") or "")[:MAX_ERROR_MESSAGE_CHARS]
+        super().__init__(f"VK API error in {self.method}: {self.code} {self.message}")
+
+    @property
+    def retryable(self) -> bool:
+        return self.code in VK_RETRYABLE_ERROR_CODES
+
+
+def is_transient_transport_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a connection-level failure worth one more attempt."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+def classify_vk_error_kind(exc: BaseException) -> str:
+    """Map a failure to a Hermes ``SendResult.error_kind`` value."""
+    if isinstance(exc, VKApiError):
+        return VK_ERROR_KINDS.get(exc.code, "unknown")
+    if is_transient_transport_error(exc):
+        return "transient"
+    return "unknown"
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Whether re-issuing the identical request is worth trying."""
+    if isinstance(exc, VKApiError):
+        return exc.retryable
+    return is_transient_transport_error(exc)
 
 
 @dataclass
@@ -47,16 +117,43 @@ class LongPollState:
 
 
 class VKRestClient:
-    def __init__(self, token: str, group_id: int, api_version: str) -> None:
+    #: Bounded backoff for the few calls that are safe to repeat.
+    RETRY_BASE_DELAY = 0.5
+    RETRY_MAX_DELAY = 30.0
+    DEFAULT_MAX_ATTEMPTS = 3
+
+    def __init__(
+        self,
+        token: str,
+        group_id: int,
+        api_version: str,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
         self.token = token
         self.group_id = group_id
         self.api_version = api_version or DEFAULT_API_VERSION
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0))
+        # Injected so backoff is exercised in tests without real sleeping and
+        # jitter is reproducible.
+        self._sleep = sleep
+        self._rng = rng or random.Random()
 
     async def close(self) -> None:
         await self.http.aclose()
 
+    def new_random_id(self) -> int:
+        """A fresh non-zero VK ``random_id``."""
+        return self._rng.randint(1, VK_RANDOM_ID_MAX)
+
     async def call(self, method: str, **params: Any) -> Any:
+        """Issue one VK API call. Never retried -- callers decide.
+
+        Most VK methods are not safe to repeat blindly (uploads attach twice,
+        edits race, callback answers are once-per-event), so retrying is opt-in
+        via :meth:`call_idempotent` rather than the default.
+        """
         response = await self.http.post(
             f"{VK_API_BASE}/{method}",
             data={"access_token": self.token, "v": self.api_version, **params},
@@ -66,6 +163,36 @@ class VKRestClient:
         if "error" in payload:
             raise VKApiError(method, payload)
         return payload.get("response")
+
+    async def call_idempotent(self, method: str, *, max_attempts: int | None = None, **params: Any):
+        """Issue a call whose parameters make a repeat safe, with backoff.
+
+        The caller must have pinned every field that makes the request unique
+        (for messages.send that is ``random_id``) *before* the first attempt, so
+        a retry after a timeout cannot become a second logical message.
+        """
+        attempts = max(1, int(max_attempts or self.DEFAULT_MAX_ATTEMPTS))
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self.call(method, **params)
+            except Exception as exc:
+                if attempt >= attempts or not is_retryable(exc):
+                    raise
+                delay = self._backoff_delay(attempt)
+                logger.info(
+                    "VK %s attempt %d/%d failed (%s); retrying in %.2fs",
+                    method,
+                    attempt,
+                    attempts,
+                    redact_secrets(exc),
+                    delay,
+                )
+                await self._sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _backoff_delay(self, attempt: int) -> float:
+        base = min(self.RETRY_BASE_DELAY * (2 ** (attempt - 1)), self.RETRY_MAX_DELAY)
+        return min(base * (1.0 + self._rng.random() * 0.25), self.RETRY_MAX_DELAY)
 
     async def get_long_poll_state(self) -> LongPollState:
         response = await self.call("groups.getLongPollServer", group_id=self.group_id)
@@ -88,10 +215,18 @@ class VKRestClient:
         reply_to: str | int | None = None,
         keyboard: str | None = None,
         sticker_id: int | None = None,
+        random_id: int | None = None,
+        max_attempts: int | None = None,
     ) -> Any:
+        """Send one VK message.
+
+        ``random_id`` is VK's idempotency key: the caller pins it so that a
+        retry after a timeout -- where VK may well have accepted the first
+        attempt -- resolves to the same logical message instead of a duplicate.
+        """
         params: dict[str, Any] = {
             "peer_id": peer_id,
-            "random_id": random.randint(1, 2_147_483_647),
+            "random_id": int(random_id) if random_id else self.new_random_id(),
         }
         if message:
             params["message"] = message
@@ -103,7 +238,7 @@ class VKRestClient:
             params["keyboard"] = keyboard
         if sticker_id:
             params["sticker_id"] = int(sticker_id)
-        return await self.call("messages.send", **params)
+        return await self.call_idempotent("messages.send", max_attempts=max_attempts, **params)
 
     async def edit_message(
         self,
