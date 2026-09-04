@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -145,7 +146,9 @@ class VKRestClient:
 
     async def set_typing(self, peer_id: int) -> None:
         try:
-            await self.call("messages.setActivity", peer_id=peer_id, type="typing", group_id=self.group_id)
+            await self.call(
+                "messages.setActivity", peer_id=peer_id, type="typing", group_id=self.group_id
+            )
         except Exception as exc:
             logger.debug("VK typing indicator failed for peer_id=%s: %s", peer_id, exc)
 
@@ -161,16 +164,18 @@ class VKRestClient:
                 chunks.append(chunk)
             return b"".join(chunks)
 
-    async def upload_document_raw(self, *, peer_id: int, path: str, title: str | None = None) -> str:
+    async def upload_document_raw(
+        self, *, peer_id: int, path: str, title: str | None = None
+    ) -> str:
         upload_server = await self.call("docs.getMessagesUploadServer", type="doc", peer_id=peer_id)
         file_path = Path(path)
         upload_name = title or file_path.name
         mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
-        with file_path.open("rb") as file_handle:
-            upload_response = await self.http.post(
-                upload_server["upload_url"],
-                files={"file": (upload_name, file_handle, mime_type)},
-            )
+        payload = await asyncio.to_thread(file_path.read_bytes)
+        upload_response = await self.http.post(
+            upload_server["upload_url"],
+            files={"file": (upload_name, payload, mime_type)},
+        )
         upload_response.raise_for_status()
         uploaded = upload_response.json()
         file_token = uploaded.get("file")
@@ -193,11 +198,11 @@ class VKRestClient:
         mime_type = VK_MESSAGE_PHOTO_MIME_TYPES.get(file_path.suffix.lower())
         if mime_type is None:
             mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
-        with file_path.open("rb") as file_handle:
-            upload_response = await self.http.post(
-                upload_server["upload_url"],
-                files={"photo": (upload_name, file_handle, mime_type)},
-            )
+        payload = await asyncio.to_thread(file_path.read_bytes)
+        upload_response = await self.http.post(
+            upload_server["upload_url"],
+            files={"photo": (upload_name, payload, mime_type)},
+        )
         upload_response.raise_for_status()
         uploaded = upload_response.json()
         photo = uploaded.get("photo")
@@ -206,7 +211,9 @@ class VKRestClient:
         if not photo or server is None or not upload_hash:
             raise RuntimeError(f"VK photo upload did not return save parameters: {uploaded}")
 
-        saved = await self.call("photos.saveMessagesPhoto", photo=photo, server=server, hash=upload_hash)
+        saved = await self.call(
+            "photos.saveMessagesPhoto", photo=photo, server=server, hash=upload_hash
+        )
         photo_obj = saved[0] if isinstance(saved, list) and saved else None
         if not isinstance(photo_obj, dict):
             raise RuntimeError(f"Unexpected photos.saveMessagesPhoto response shape: {saved}")

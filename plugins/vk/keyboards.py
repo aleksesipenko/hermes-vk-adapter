@@ -5,31 +5,26 @@ from __future__ import annotations
 import json
 from typing import Any
 
-try:
-    from vkbottle import Callback, Keyboard, KeyboardButtonColor, Text
-except Exception:  # pragma: no cover - raw JSON fallback is supported.
-    Callback = None
-    Keyboard = None
-    KeyboardButtonColor = None
-    Text = None
-
 PROVIDER_PAGE_SIZE = 6
 MODEL_PAGE_SIZE = 6
+
+
+def _cb(label: str, **payload: Any) -> dict[str, Any]:
+    """A VK ``callback`` button. Payload keys are kept short — VK caps it."""
+    return {"type": "callback", "label": label, "payload": payload}
+
+
+def _txt(label: str, color: str = "secondary") -> dict[str, Any]:
+    return {"type": "text", "label": label, "color": color}
 
 
 class VKKeyboardFactory:
     def command_keyboard(self) -> str:
         return self._keyboard_json(
             [
-                [{"type": "text", "label": "/commands", "color": "primary"}],
-                [
-                    {"type": "text", "label": "/status", "color": "secondary"},
-                    {"type": "text", "label": "/model", "color": "secondary"},
-                ],
-                [
-                    {"type": "text", "label": "/new", "color": "secondary"},
-                    {"type": "text", "label": "/stop", "color": "negative"},
-                ],
+                [_txt("/commands", "primary")],
+                [_txt("/status"), _txt("/model")],
+                [_txt("/new"), _txt("/stop", "negative")],
             ],
             inline=False,
         )
@@ -38,12 +33,12 @@ class VKKeyboardFactory:
         return self._keyboard_json(
             [
                 [
-                    {"type": "callback", "label": "Allow once", "payload": {"h": "ea", "id": approval_id, "c": "once"}},
-                    {"type": "callback", "label": "Session", "payload": {"h": "ea", "id": approval_id, "c": "session"}},
+                    _cb("Allow once", h="ea", id=approval_id, c="once"),
+                    _cb("Session", h="ea", id=approval_id, c="session"),
                 ],
                 [
-                    {"type": "callback", "label": "Always", "payload": {"h": "ea", "id": approval_id, "c": "always"}},
-                    {"type": "callback", "label": "Deny", "payload": {"h": "ea", "id": approval_id, "c": "deny"}},
+                    _cb("Always", h="ea", id=approval_id, c="always"),
+                    _cb("Deny", h="ea", id=approval_id, c="deny"),
                 ],
             ],
             inline=True,
@@ -53,42 +48,36 @@ class VKKeyboardFactory:
         return self._keyboard_json(
             [
                 [
-                    {"type": "callback", "label": "Approve once", "payload": {"h": "sc", "id": confirm_id, "c": "once"}},
-                    {"type": "callback", "label": "Always", "payload": {"h": "sc", "id": confirm_id, "c": "always"}},
+                    _cb("Approve once", h="sc", id=confirm_id, c="once"),
+                    _cb("Always", h="sc", id=confirm_id, c="always"),
                 ],
-                [{"type": "callback", "label": "Cancel", "payload": {"h": "sc", "id": confirm_id, "c": "cancel"}}],
+                [_cb("Cancel", h="sc", id=confirm_id, c="cancel")],
             ],
             inline=True,
         )
 
     def clarify_keyboard(self, choices: list, clarify_id: str) -> str:
         buttons = [
-            {"type": "callback", "label": str(index + 1), "payload": {"h": "cl", "id": clarify_id, "c": index}}
+            _cb(str(index + 1), h="cl", id=clarify_id, c=index)
             for index, _choice in enumerate(choices[:8])
         ]
-        buttons.append({"type": "callback", "label": "Other", "payload": {"h": "cl", "id": clarify_id, "c": "other"}})
-        rows = _chunk_buttons(buttons, size=2)
-        return self._keyboard_json(rows, inline=True)
+        buttons.append(_cb("Other", h="cl", id=clarify_id, c="other"))
+        return self._keyboard_json(_chunk_buttons(buttons, size=2), inline=True)
 
     def provider_keyboard(self, providers: list, page: int = 0) -> str:
         page = _bounded_page(page, len(providers), PROVIDER_PAGE_SIZE)
         start = page * PROVIDER_PAGE_SIZE
         visible = providers[start : start + PROVIDER_PAGE_SIZE]
-        buttons = []
-        for offset, _provider in enumerate(visible):
-            buttons.append(
-                {
-                    "type": "callback",
-                    "label": str(offset + 1),
-                    "payload": {"h": "mpc", "pg": page, "p": start + offset},
-                }
-            )
+        buttons = [
+            _cb(str(offset + 1), h="mpc", pg=page, p=start + offset)
+            for offset, _provider in enumerate(visible)
+        ]
         rows = _chunk_buttons(buttons, size=3)
-        nav = [{"type": "callback", "label": "Close", "payload": {"h": "mc"}}]
+        nav = [_cb("Close", h="mc")]
         if page > 0:
-            nav.append({"type": "callback", "label": "Prev", "payload": {"h": "mp", "pg": page - 1}})
+            nav.append(_cb("Prev", h="mp", pg=page - 1))
         if start + PROVIDER_PAGE_SIZE < len(providers):
-            nav.append({"type": "callback", "label": "Next", "payload": {"h": "mp", "pg": page + 1}})
+            nav.append(_cb("Next", h="mp", pg=page + 1))
         rows.extend(_chunk_buttons(nav, size=3))
         return self._keyboard_json(rows, inline=True)
 
@@ -97,41 +86,21 @@ class VKKeyboardFactory:
         page = _bounded_page(page, len(models), MODEL_PAGE_SIZE)
         start = page * MODEL_PAGE_SIZE
         visible = models[start : start + MODEL_PAGE_SIZE]
-        rows = []
-        buttons = []
-        for offset, _model_id in enumerate(visible):
-            buttons.append(
-                {
-                    "type": "callback",
-                    "label": str(offset + 1),
-                    "payload": {"h": "mm", "p": provider_index, "pg": page, "m": start + offset},
-                }
-            )
-        rows.extend(_chunk_buttons(buttons, size=3))
-        nav = [{"type": "callback", "label": "Back", "payload": {"h": "mb"}}]
+        buttons = [
+            _cb(str(offset + 1), h="mm", p=provider_index, pg=page, m=start + offset)
+            for offset, _model_id in enumerate(visible)
+        ]
+        rows = _chunk_buttons(buttons, size=3)
+        nav = [_cb("Back", h="mb")]
         if page > 0:
-            nav.append({"type": "callback", "label": "Prev", "payload": {"h": "mmp", "p": provider_index, "pg": page - 1}})
+            nav.append(_cb("Prev", h="mmp", p=provider_index, pg=page - 1))
         if start + MODEL_PAGE_SIZE < len(models):
-            nav.append({"type": "callback", "label": "Next", "payload": {"h": "mmp", "p": provider_index, "pg": page + 1}})
+            nav.append(_cb("Next", h="mmp", p=provider_index, pg=page + 1))
         rows.extend(_chunk_buttons(nav, size=3))
-        rows.append([{"type": "callback", "label": "Close", "payload": {"h": "mc"}}])
+        rows.append([_cb("Close", h="mc")])
         return self._keyboard_json(rows, inline=True)
 
     def _keyboard_json(self, rows: list[list[dict[str, Any]]], *, inline: bool) -> str:
-        if Keyboard is not None and Text is not None and Callback is not None:
-            keyboard = Keyboard(one_time=False, inline=inline)
-            for row_index, row in enumerate(rows):
-                if row_index:
-                    keyboard.row()
-                for button in row:
-                    if button["type"] == "callback":
-                        keyboard.add(Callback(button["label"], payload=button["payload"]))
-                    else:
-                        color_name = button.get("color", "secondary").upper()
-                        color = getattr(KeyboardButtonColor, color_name, None) if KeyboardButtonColor else None
-                        keyboard.add(Text(button["label"]), color=color)
-            return keyboard.get_json()
-
         buttons = []
         for row in rows:
             rendered = []
@@ -144,7 +113,11 @@ class VKKeyboardFactory:
                     item["color"] = button["color"]
                 rendered.append(item)
             buttons.append(rendered)
-        return json.dumps({"one_time": False, "inline": inline, "buttons": buttons}, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            {"one_time": False, "inline": inline, "buttons": buttons},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 def model_picker_provider_text(

@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28,<1.0",
-    "vkbottle>=4.8,<5.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +19,14 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["vendor", ".venv", ".hermes-local"]
+
+# Pinned explicitly: ruff's implicit default rule set changes between minor
+# releases, so an unpinned `select` makes the same commit lint clean locally and
+# fail in CI (or the reverse). These are the rules this repository actually
+# enforces.
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

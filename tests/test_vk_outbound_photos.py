@@ -143,7 +143,12 @@ async def test_send_image_file_uses_vk_native_photo_upload(tmp_path: Path) -> No
     assert adapter.client.photo_uploads == [{"peer_id": 987654321, "path": str(image_path)}]
     assert adapter.client.document_uploads == []
     assert adapter.client.messages == [
-        {"peer_id": 987654321, "message": "Preview", "attachment": "photo-123_456_access", "reply_to": "55"}
+        {
+            "peer_id": 987654321,
+            "message": "Preview",
+            "attachment": "photo-123_456_access",
+            "reply_to": "55",
+        }
     ]
 
 
@@ -178,9 +183,10 @@ async def test_send_image_file_falls_back_to_document_for_unsupported_webp(tmp_p
 
     adapter = object.__new__(VKAdapter)
     adapter.client = FakeClient()
-    adapter.vkbottle_api = None
 
-    result = await VKAdapter.send_image_file(adapter, chat_id="987654321", image_path=str(image_path))
+    result = await VKAdapter.send_image_file(
+        adapter, chat_id="987654321", image_path=str(image_path)
+    )
 
     assert result.success
     assert result.message_id == "654"
@@ -240,7 +246,6 @@ async def test_send_image_file_falls_back_to_document_when_vk_photo_upload_fails
 
     adapter = object.__new__(VKAdapter)
     adapter.client = FakeClient()
-    adapter.vkbottle_api = None
 
     result = await VKAdapter.send_image_file(
         adapter,

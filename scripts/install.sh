@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${HERMES_VK_REPO:-aleksesipenko/hermes-vk-adapter}"
 PLUGIN_NAME="${HERMES_VK_PLUGIN_NAME:-vk}"
-PY_DEPS=(vkbottle httpx)
+PY_DEPS=(httpx)
 
 say() {
   printf '\n%s\n' "$*"

@@ -90,6 +90,31 @@ if _PURELIB and _PURELIB not in sys.path:
 HERMES_ROOT = _bootstrap_hermes_path()
 
 
+def _merge_plugins_package(hermes_root: Path | None) -> None:
+    """Bind ``plugins`` to this repo and let Hermes' own ``plugins`` resolve too.
+
+    Both this repository and Hermes ship a top-level regular package named
+    ``plugins``.  A regular package's ``__path__`` is fixed at first import, so
+    whichever one is imported first wins and the other's submodules become
+    unimportable -- which made test collection depend on the order of import
+    statements inside each test module.
+
+    Importing this repo's package eagerly and then appending Hermes' directory
+    to its ``__path__`` makes ``plugins.vk`` always resolve here and
+    ``plugins.<hermes module>`` always resolve there, regardless of order.
+    """
+    import plugins  # imported here, after sys.path is prepared
+
+    if hermes_root is None:
+        return
+    hermes_plugins = hermes_root / "plugins"
+    if hermes_plugins.is_dir() and str(hermes_plugins) not in plugins.__path__:
+        plugins.__path__.append(str(hermes_plugins))
+
+
+_merge_plugins_package(HERMES_ROOT)
+
+
 def hermes_available() -> bool:
     """Whether the Hermes contract can be imported in this environment."""
     if HERMES_ROOT is None:

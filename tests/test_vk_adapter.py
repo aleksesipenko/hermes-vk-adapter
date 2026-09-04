@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import respx
+from gateway.platforms.base import MessageType
 from httpx import Response
 
 from plugins.vk.adapter import (
@@ -17,10 +18,9 @@ from plugins.vk.adapter import (
     _largest_photo_url,
     _safe_int,
     _truthy,
-    _vk_attachment_ref,
     register,
 )
-from gateway.platforms.base import MessageType
+from plugins.vk.utils import _vk_attachment_ref
 
 
 def test_truthy_csv_and_safe_int_helpers():
@@ -145,7 +145,8 @@ async def test_raw_document_upload_flow(tmp_path: Path):
     )
 
     try:
-        assert await client.upload_document_raw(peer_id=987654321, path=str(file_path)) == "doc-1_99"
+        ref = await client.upload_document_raw(peer_id=987654321, path=str(file_path))
+        assert ref == "doc-1_99"
     finally:
         await client.close()
 
@@ -153,8 +154,9 @@ async def test_raw_document_upload_flow(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_send_document_accepts_gateway_file_path_contract(tmp_path: Path):
     class FakeClient:
-        uploads = []
-        messages = []
+        def __init__(self):
+            self.uploads = []
+            self.messages = []
 
         async def upload_document_raw(self, *, peer_id: int, path: str, title: str | None = None):
             self.uploads.append({"peer_id": peer_id, "path": path, "title": title})
@@ -169,7 +171,6 @@ async def test_send_document_accepts_gateway_file_path_contract(tmp_path: Path):
 
     adapter = object.__new__(VKAdapter)
     adapter.client = FakeClient()
-    adapter.vkbottle_api = None
 
     result = await VKAdapter.send_document(
         adapter,
@@ -209,7 +210,6 @@ async def test_send_document_explains_missing_vk_docs_scope(tmp_path: Path):
 
     adapter = object.__new__(VKAdapter)
     adapter.client = FakeClient()
-    adapter.vkbottle_api = None
 
     result = await VKAdapter.send_document(
         adapter,
@@ -369,7 +369,9 @@ async def test_extract_regular_document_uses_gateway_mime_type(monkeypatch):
         assert filename == "report.pdf"
         return "/tmp/report.pdf"
 
-    monkeypatch.setattr("plugins.vk.adapter.cache_document_from_bytes", fake_cache_document_from_bytes)
+    monkeypatch.setattr(
+        "plugins.vk.adapter.cache_document_from_bytes", fake_cache_document_from_bytes
+    )
 
     media_paths, media_types, message_type = await VKAdapter._extract_media(
         adapter,
@@ -489,7 +491,11 @@ def test_vk_inline_keyboards_stay_within_row_limits():
     model_keyboard = json.loads(
         VKAdapter._model_keyboard(
             adapter,
-            {"name": "Provider", "slug": "provider", "models": [f"model-{index}" for index in range(10)]},
+            {
+                "name": "Provider",
+                "slug": "provider",
+                "models": [f"model-{index}" for index in range(10)],
+            },
             0,
         )
     )
@@ -517,8 +523,9 @@ def test_model_picker_uses_numbered_buttons_and_navigation():
     ]
 
     provider_keyboard = json.loads(VKAdapter._provider_keyboard(adapter, providers))
-    provider_labels = [button["action"]["label"] for row in provider_keyboard["buttons"] for button in row]
-    provider_payloads = [button["action"].get("payload") for row in provider_keyboard["buttons"] for button in row]
+    provider_buttons = [button for row in provider_keyboard["buttons"] for button in row]
+    provider_labels = [button["action"]["label"] for button in provider_buttons]
+    provider_payloads = [button["action"].get("payload") for button in provider_buttons]
 
     assert provider_labels[:6] == ["1", "2", "3", "4", "5", "6"]
     assert "Next" in provider_labels
@@ -530,8 +537,9 @@ def test_model_picker_uses_numbered_buttons_and_navigation():
     assert {"h": "mc"} in provider_payloads
 
     model_keyboard = json.loads(VKAdapter._model_keyboard(adapter, providers[0], 0))
-    model_labels = [button["action"]["label"] for row in model_keyboard["buttons"] for button in row]
-    model_payloads = [button["action"].get("payload") for row in model_keyboard["buttons"] for button in row]
+    model_buttons = [button for row in model_keyboard["buttons"] for button in row]
+    model_labels = [button["action"]["label"] for button in model_buttons]
+    model_payloads = [button["action"].get("payload") for button in model_buttons]
 
     assert model_labels[:6] == ["1", "2", "3", "4", "5", "6"]
     assert model_labels[6:] == ["Back", "Next", "Close"]
@@ -705,7 +713,11 @@ async def test_model_picker_callbacks_call_selected_model():
     adapter._model_picker_state = {
         "987654321": {
             "providers": [
-                {"slug": "openrouter", "name": "OpenRouter", "models": ["deepseek/chat", "qwen/chat"]}
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "models": ["deepseek/chat", "qwen/chat"],
+                }
             ],
             "on_model_selected": on_model_selected,
         }

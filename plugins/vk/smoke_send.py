@@ -17,7 +17,7 @@ from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from plugins.vk.client import VKRestClient  # noqa: E402
+    from plugins.vk.client import VKRestClient
 else:
     from .client import VKRestClient
 

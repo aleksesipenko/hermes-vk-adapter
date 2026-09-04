@@ -7,25 +7,17 @@ import json
 import logging
 import mimetypes
 import os
-from typing import Any, Optional
+from typing import Any
 
 import httpx
-
-try:
-    from vkbottle import API as VKBottleAPI
-    from vkbottle import DocMessagesUploader
-except Exception:  # pragma: no cover - raw HTTP fallback is supported.
-    VKBottleAPI = None
-    DocMessagesUploader = None
-
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    SUPPORTED_DOCUMENT_TYPES,
+    SUPPORTED_IMAGE_DOCUMENT_TYPES,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
-    SUPPORTED_DOCUMENT_TYPES,
-    SUPPORTED_IMAGE_DOCUMENT_TYPES,
     cache_audio_from_url,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -33,7 +25,7 @@ from gateway.platforms.base import (
 )
 
 from .callbacks import VKCallbackRouter
-from .client import LongPollState, VKApiError, VKRestClient, VK_MESSAGE_PHOTO_MIME_TYPES
+from .client import VK_MESSAGE_PHOTO_MIME_TYPES, LongPollState, VKApiError, VKRestClient
 from .formatting import render_vk_plain_text
 from .keyboards import VKKeyboardFactory, model_picker_provider_text
 from .utils import (
@@ -44,7 +36,6 @@ from .utils import (
     _largest_photo_url,
     _safe_int,
     _truthy,
-    _vk_attachment_ref,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,9 +45,13 @@ class VKAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("vk"))
         extra = getattr(config, "extra", {}) or {}
-        self.token = os.getenv("VK_GROUP_TOKEN") or getattr(config, "token", "") or extra.get("token", "")
+        self.token = (
+            os.getenv("VK_GROUP_TOKEN") or getattr(config, "token", "") or extra.get("token", "")
+        )
         self.group_id = _safe_int(os.getenv("VK_GROUP_ID") or extra.get("group_id"), 0)
-        self.api_version = os.getenv("VK_API_VERSION") or extra.get("api_version") or DEFAULT_API_VERSION
+        self.api_version = (
+            os.getenv("VK_API_VERSION") or extra.get("api_version") or DEFAULT_API_VERSION
+        )
         self.wait_seconds = _safe_int(
             os.getenv("VK_POLL_WAIT_SECONDS") or extra.get("poll_wait_seconds"),
             DEFAULT_POLL_WAIT_SECONDS,
@@ -65,7 +60,9 @@ class VKAdapter(BasePlatformAdapter):
             os.getenv("VK_MAX_MESSAGE_LENGTH") or extra.get("max_message_length"),
             DEFAULT_MAX_MESSAGE_LENGTH,
         )
-        self.require_mention = _truthy(os.getenv("VK_REQUIRE_MENTION") or extra.get("require_mention"))
+        self.require_mention = _truthy(
+            os.getenv("VK_REQUIRE_MENTION") or extra.get("require_mention")
+        )
         self.command_keyboard_enabled = not _truthy(
             os.getenv("VK_COMMAND_KEYBOARD_DISABLED")
             or (str(os.getenv("VK_COMMAND_KEYBOARD", "")).lower() == "false")
@@ -74,7 +71,6 @@ class VKAdapter(BasePlatformAdapter):
         self.allowed_users = _csv_set(os.getenv("VK_ALLOWED_USERS"))
         self.allow_all_users = _truthy(os.getenv("VK_ALLOW_ALL_USERS"))
         self.client: VKRestClient | None = None
-        self.vkbottle_api: Any = None
         self.poll_task: asyncio.Task | None = None
         self.longpoll_state: LongPollState | None = None
         self._approval_counter = 0
@@ -94,15 +90,12 @@ class VKAdapter(BasePlatformAdapter):
             return False
 
         self.client = VKRestClient(self.token, self.group_id, self.api_version)
-        if VKBottleAPI is not None:
-            try:
-                self.vkbottle_api = VKBottleAPI(self.token)
-            except Exception as exc:
-                logger.debug("vkbottle API init failed; raw fallback remains active: %s", exc)
         self.longpoll_state = await self.client.get_long_poll_state()
         self._mark_connected()
         self.poll_task = asyncio.create_task(self._poll_loop(), name="hermes-vk-longpoll")
-        logger.info("VK adapter connected: group_id=%s api_version=%s", self.group_id, self.api_version)
+        logger.info(
+            "VK adapter connected: group_id=%s api_version=%s", self.group_id, self.api_version
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -116,7 +109,7 @@ class VKAdapter(BasePlatformAdapter):
         if self.client:
             await self.client.close()
 
-    async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+    async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         if not self.client:
             return
         peer_id = _safe_int(chat_id)
@@ -127,8 +120,8 @@ class VKAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -141,7 +134,12 @@ class VKAdapter(BasePlatformAdapter):
             sent_ids: list[str] = []
             for index, chunk in enumerate(chunks):
                 current_reply_to = reply_to if index == 0 else None
-                keyboard = self._command_keyboard() if self.command_keyboard_enabled and index == 0 else None
+                first_chunk = index == 0
+                keyboard = (
+                    self._command_keyboard()
+                    if self.command_keyboard_enabled and first_chunk
+                    else None
+                )
                 try:
                     response = await self.client.send_message(
                         peer_id=peer_id,
@@ -152,7 +150,9 @@ class VKAdapter(BasePlatformAdapter):
                 except VKApiError as exc:
                     if not current_reply_to or "reply_to" not in str(exc):
                         raise
-                    logger.info("VK reply_to rejected for peer_id=%s; retrying without reply_to", peer_id)
+                    logger.info(
+                        "VK reply_to rejected for peer_id=%s; retrying without reply_to", peer_id
+                    )
                     response = await self.client.send_message(
                         peer_id=peer_id,
                         message=self.format_message(chunk),
@@ -172,10 +172,10 @@ class VKAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         file_path: str,
-        caption: Optional[str] = None,
-        file_name: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SendResult:
         file_names = [file_name] if file_name else None
@@ -193,9 +193,9 @@ class VKAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SendResult:
         if not self.client:
@@ -203,7 +203,7 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
-        if not os.path.exists(image_path):
+        if not await asyncio.to_thread(os.path.exists, image_path):
             return SendResult(success=False, error=f"VK image path does not exist: {image_path}")
         if os.path.splitext(image_path)[1].lower() not in VK_MESSAGE_PHOTO_MIME_TYPES:
             return await self.send_document(
@@ -217,7 +217,11 @@ class VKAdapter(BasePlatformAdapter):
             )
         try:
             ref = await self.client.upload_photo_message_raw(peer_id=peer_id, path=image_path)
-            send_kwargs: dict[str, Any] = {"peer_id": peer_id, "message": caption or "", "attachment": ref}
+            send_kwargs: dict[str, Any] = {
+                "peer_id": peer_id,
+                "message": caption or "",
+                "attachment": ref,
+            }
             if reply_to:
                 send_kwargs["reply_to"] = reply_to
             try:
@@ -225,7 +229,9 @@ class VKAdapter(BasePlatformAdapter):
             except VKApiError as exc:
                 if not reply_to or "reply_to" not in str(exc):
                     raise
-                logger.info("VK photo reply_to rejected for peer_id=%s; retrying without reply_to", peer_id)
+                logger.info(
+                    "VK photo reply_to rejected for peer_id=%s; retrying without reply_to", peer_id
+                )
                 response = await self.client.send_message(
                     peer_id=peer_id,
                     message=caption or "",
@@ -264,9 +270,9 @@ class VKAdapter(BasePlatformAdapter):
         media_files: list[str],
         caption: str = "",
         *,
-        file_names: Optional[list[str | None]] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        file_names: list[str | None] | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SendResult:
         if not self.client:
@@ -275,13 +281,19 @@ class VKAdapter(BasePlatformAdapter):
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         for file_path in media_files:
-            if not os.path.exists(file_path):
-                return SendResult(success=False, error=f"VK document path does not exist: {file_path}")
+            if not await asyncio.to_thread(os.path.exists, file_path):
+                return SendResult(
+                    success=False, error=f"VK document path does not exist: {file_path}"
+                )
         try:
             refs = []
             for index, file_path in enumerate(media_files):
                 title = file_names[index] if file_names and index < len(file_names) else None
-                refs.append(await self._upload_document(peer_id=peer_id, path=file_path, title=title))
+                refs.append(
+                    await self.client.upload_document_raw(
+                        peer_id=peer_id, path=file_path, title=title
+                    )
+                )
             try:
                 send_kwargs: dict[str, Any] = {
                     "peer_id": peer_id,
@@ -294,7 +306,9 @@ class VKAdapter(BasePlatformAdapter):
             except VKApiError as exc:
                 if not reply_to or "reply_to" not in str(exc):
                     raise
-                logger.info("VK media reply_to rejected for peer_id=%s; retrying without reply_to", peer_id)
+                logger.info(
+                    "VK media reply_to rejected for peer_id=%s; retrying without reply_to", peer_id
+                )
                 response = await self.client.send_message(
                     peer_id=peer_id,
                     message=caption,
@@ -328,26 +342,6 @@ class VKAdapter(BasePlatformAdapter):
             )
         return str(exc)
 
-    async def _upload_document(self, *, peer_id: int, path: str, title: str | None = None) -> str:
-        if self.vkbottle_api is not None and DocMessagesUploader is not None:
-            try:
-                uploader = DocMessagesUploader(self.vkbottle_api)
-                upload_kwargs = {"title": title} if title else {}
-                uploaded = await uploader.upload(path, peer_id=peer_id, **upload_kwargs)
-                ref = getattr(uploaded, "attachment", None) or getattr(uploaded, "attach", None)
-                if ref:
-                    return str(ref)
-                if isinstance(uploaded, dict):
-                    dict_ref = _vk_attachment_ref("doc", uploaded)
-                    if dict_ref:
-                        return dict_ref
-                if isinstance(uploaded, str):
-                    return uploaded
-            except Exception as exc:
-                logger.debug("vkbottle document upload failed, falling back to raw VK upload: %s", exc)
-        assert self.client is not None
-        return await self.client.upload_document_raw(peer_id=peer_id, path=path, title=title)
-
     async def _poll_loop(self) -> None:
         assert self.client is not None
         while self._running:
@@ -356,7 +350,10 @@ class VKAdapter(BasePlatformAdapter):
                     self.longpoll_state = await self.client.get_long_poll_state()
                 payload = await self.client.poll(self.longpoll_state, self.wait_seconds)
                 if self.debug_updates:
-                    logger.info("VK Long Poll payload: %s", json.dumps(payload, ensure_ascii=False)[:4000])
+                    logger.info(
+                        "VK Long Poll payload: %s",
+                        json.dumps(payload, ensure_ascii=False)[:4000],
+                    )
 
                 if payload.get("failed"):
                     await self._handle_longpoll_failed(payload)
@@ -383,14 +380,16 @@ class VKAdapter(BasePlatformAdapter):
     async def _handle_update(self, update: dict[str, Any]) -> None:
         if update.get("type") != "message_new":
             if update.get("type") == "message_event":
-                await self._handle_message_event((update.get("object") or {}))
+                await self._handle_message_event(update.get("object") or {})
                 return
             logger.debug("VK update ignored: type=%s", update.get("type"))
             return
         message = (update.get("object") or {}).get("message") or {}
         await self._handle_message_new(message, update)
 
-    async def _handle_message_new(self, message: dict[str, Any], raw_update: dict[str, Any]) -> None:
+    async def _handle_message_new(
+        self, message: dict[str, Any], raw_update: dict[str, Any]
+    ) -> None:
         peer_id = _safe_int(message.get("peer_id"), 0)
         from_id = _safe_int(message.get("from_id"), 0)
         text = str(message.get("text") or "").strip()
@@ -404,10 +403,16 @@ class VKAdapter(BasePlatformAdapter):
         if not peer_id or not from_id:
             return
         if not self._is_allowed_vk_user(from_id):
-            logger.info("VK user denied by local allowlist: from_id=%s peer_id=%s", from_id, peer_id)
+            logger.info(
+                "VK user denied by local allowlist: from_id=%s peer_id=%s", from_id, peer_id
+            )
             return
 
-        if chat_type == "group" and self.require_mention and not self._is_group_activation(text, message):
+        if (
+            chat_type == "group"
+            and self.require_mention
+            and not self._is_group_activation(text, message)
+        ):
             return
 
         media_paths, media_types, inferred_type = await self._extract_media(message)
@@ -460,7 +465,9 @@ class VKAdapter(BasePlatformAdapter):
             setattr(self, name, state)
         return state
 
-    async def _extract_media(self, message: dict[str, Any]) -> tuple[list[str], list[str], MessageType]:
+    async def _extract_media(
+        self, message: dict[str, Any]
+    ) -> tuple[list[str], list[str], MessageType]:
         media_paths: list[str] = []
         media_types: list[str] = []
         inferred = MessageType.TEXT
@@ -500,7 +507,9 @@ class VKAdapter(BasePlatformAdapter):
                         if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES or mime_type.startswith("image/"):
                             image_ext = ext if ext in SUPPORTED_IMAGE_DOCUMENT_TYPES else ".jpg"
                             media_paths.append(cache_image_from_bytes(data, image_ext))
-                            media_types.append(mime_type if mime_type.startswith("image/") else "image/jpeg")
+                            media_types.append(
+                                mime_type if mime_type.startswith("image/") else "image/jpeg"
+                            )
                             inferred = MessageType.PHOTO
                         else:
                             media_paths.append(cache_document_from_bytes(data, title))
@@ -601,7 +610,8 @@ class VKAdapter(BasePlatformAdapter):
 
     def _is_retryable(self, exc: Exception) -> bool:
         text = str(exc).lower()
-        return any(marker in text for marker in ("timeout", "temporarily", "connection", "429", "5xx"))
+        markers = ("timeout", "temporarily", "connection", "429", "5xx")
+        return any(marker in text for marker in markers)
 
     async def send_exec_approval(
         self,
@@ -609,7 +619,7 @@ class VKAdapter(BasePlatformAdapter):
         command: str,
         session_key: str,
         description: str = "dangerous command",
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -639,7 +649,7 @@ class VKAdapter(BasePlatformAdapter):
         message: str,
         session_key: str,
         confirm_id: str,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -662,10 +672,10 @@ class VKAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         question: str,
-        choices: Optional[list],
+        choices: list | None,
         clarify_id: str,
         session_key: str,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -675,7 +685,10 @@ class VKAdapter(BasePlatformAdapter):
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
         if clean_choices:
             lines = [f"Question: {question}", ""]
-            lines.extend(f"{index}. {choice}" for index, choice in enumerate(clean_choices[:8], start=1))
+            lines.extend(
+                f"{index}. {choice}"
+                for index, choice in enumerate(clean_choices[:8], start=1)
+            )
             keyboard = self._clarify_keyboard(clean_choices, clarify_id)
         else:
             lines = [f"Question: {question}", "", "Reply in this chat with your answer."]
@@ -706,7 +719,7 @@ class VKAdapter(BasePlatformAdapter):
         current_provider: str,
         session_key: str,
         on_model_selected,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not self.client:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -754,9 +767,14 @@ async def _standalone_send(
     try:
         attachment = None
         if media_files:
-            refs = [await client.upload_document_raw(peer_id=peer_id, path=path) for path in media_files]
+            refs = [
+                await client.upload_document_raw(peer_id=peer_id, path=path)
+                for path in media_files
+            ]
             attachment = ",".join(refs)
-        response = await client.send_message(peer_id=peer_id, message=message, attachment=attachment)
+        response = await client.send_message(
+            peer_id=peer_id, message=message, attachment=attachment
+        )
         return {"success": True, "message_id": str(response)}
     except Exception as exc:
         return {"error": str(exc)}
@@ -767,7 +785,6 @@ async def _standalone_send(
 def check_requirements() -> bool:
     try:
         import httpx as _httpx  # noqa: F401
-        import vkbottle as _vkbottle  # noqa: F401
     except Exception:
         return False
     return bool(os.getenv("VK_GROUP_TOKEN") and os.getenv("VK_GROUP_ID"))
@@ -804,12 +821,14 @@ def register(ctx: Any) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=["VK_GROUP_TOKEN", "VK_GROUP_ID"],
-        install_hint="pip install vkbottle httpx",
+        install_hint="pip install httpx",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="VK_HOME_PEER_ID",
         allowed_users_env="VK_ALLOWED_USERS",
         allow_all_env="VK_ALLOW_ALL_USERS",
-        max_message_length=_safe_int(os.getenv("VK_MAX_MESSAGE_LENGTH"), DEFAULT_MAX_MESSAGE_LENGTH),
+        max_message_length=_safe_int(
+            os.getenv("VK_MAX_MESSAGE_LENGTH"), DEFAULT_MAX_MESSAGE_LENGTH
+        ),
         platform_hint=(
             "You are chatting through VK. Keep formatting simple and avoid "
             "Telegram-specific markdown."

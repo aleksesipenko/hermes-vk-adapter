@@ -52,8 +52,11 @@ curl -fsSL https://raw.githubusercontent.com/aleksesipenko/hermes-vk-adapter/mai
 ```
 
 Bootstrap-скрипт использует официальный Hermes CLI. Он проверяет `hermes` и
-`git`, ставит `vkbottle` и `httpx` в Python-окружение, из которого запускается
-Hermes, затем выполняет `hermes plugins install ... --enable`.
+`git`, ставит `httpx` в Python-окружение, из которого запускается Hermes, затем
+выполняет `hermes plugins install ... --enable`.
+
+`httpx` — единственная runtime-зависимость плагина. Весь VK-трафик идёт через
+один raw HTTP-клиент: отдельный VK SDK не нужен и не используется.
 
 Во время установки Hermes CLI спросит обязательные значения из `plugin.yaml` и
 сохранит их в `~/.hermes/.env`:

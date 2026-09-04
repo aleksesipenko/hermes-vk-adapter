@@ -123,7 +123,11 @@ class VKCallbackRouter:
                 await self.client.send_message(
                     peer_id=peer_id,
                     message=render_vk_plain_text(str(result_text)),
-                    keyboard=self.keyboards.command_keyboard() if self.command_keyboard_enabled else None,
+                    keyboard=(
+                        self.keyboards.command_keyboard()
+                        if self.command_keyboard_enabled
+                        else None
+                    ),
                 )
         except Exception as exc:
             logger.warning("VK slash-confirm callback failed: %s", exc)
