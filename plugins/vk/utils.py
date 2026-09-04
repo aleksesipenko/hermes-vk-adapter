@@ -79,3 +79,37 @@ def _largest_photo_url(photo: dict[str, Any]) -> str | None:
 # and for how long a retry should resolve to the same VK random_id.
 OUTBOUND_IDEMPOTENCY_MAX_ENTRIES = 512
 OUTBOUND_IDEMPOTENCY_TTL_SECONDS = 120.0
+
+# Recently handled Long Poll events, so an in-process redelivery (a `failed`
+# recovery that rewinds ts, an overlapping poll after reconnect) is suppressed.
+SEEN_EVENT_MAX_ENTRIES = 2048
+SEEN_EVENT_TTL_SECONDS = 600.0
+
+
+def update_dedupe_key(update: dict[str, Any]) -> tuple[Any, ...] | None:
+    """A stable identity for a Long Poll update, or None when it has none.
+
+    Only VK-assigned identifiers are used. An update without one is never
+    deduplicated: dropping an event we cannot identify would be worse than
+    handling it twice.
+    """
+    if not isinstance(update, dict):
+        return None
+    kind = str(update.get("type") or "")
+    obj = update.get("object")
+    if not isinstance(obj, dict):
+        return None
+
+    if kind == "message_event":
+        event_id = str(obj.get("event_id") or "")
+        return ("message_event", event_id) if event_id else None
+
+    message = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    if not isinstance(message, dict):
+        return None
+    peer_id = _safe_int(message.get("peer_id"), 0)
+    message_id = _safe_int(message.get("id"), 0)
+    cmid = _safe_int(message.get("conversation_message_id"), 0)
+    if not peer_id or not (message_id or cmid):
+        return None
+    return (kind, peer_id, message_id, cmid)

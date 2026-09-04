@@ -116,7 +116,14 @@ async def test_longpoll_failed_one_only_updates_ts():
 
 
 @pytest.mark.asyncio
-async def test_longpoll_failed_two_refetches_state():
+async def test_longpoll_failed_two_renews_the_key_but_keeps_our_position():
+    """failed=2 means only the key expired.
+
+    Adopting VK's fresh ts here would silently skip every event that arrived
+    between our last poll and the key renewal. The full-refresh behaviour
+    belongs to failed=3; see tests/test_vk_longpoll.py for the whole matrix.
+    """
+
     class FakeClient:
         async def get_long_poll_state(self):
             return LongPollState(server="new-server", key="new-key", ts="new-ts")
@@ -125,9 +132,9 @@ async def test_longpoll_failed_two_refetches_state():
     adapter.client = FakeClient()
     adapter.longpoll_state = LongPollState(server="old-server", key="old-key", ts="old-ts")
 
-    await VKAdapter._handle_longpoll_failed(adapter, {"failed": 2})
+    assert await VKAdapter._handle_longpoll_failed(adapter, {"failed": 2}) is True
 
-    assert adapter.longpoll_state == LongPollState("new-server", "new-key", "new-ts")
+    assert adapter.longpoll_state == LongPollState("new-server", "new-key", "old-ts")
 
 
 @pytest.mark.asyncio

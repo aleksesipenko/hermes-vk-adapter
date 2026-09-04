@@ -8,6 +8,8 @@ import json
 import logging
 import mimetypes
 import os
+import random
+import time
 from typing import Any
 
 import httpx
@@ -43,17 +45,24 @@ from .utils import (
     DEFAULT_POLL_WAIT_SECONDS,
     OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
     OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
+    SEEN_EVENT_MAX_ENTRIES,
+    SEEN_EVENT_TTL_SECONDS,
     _csv_set,
     _largest_photo_url,
     _safe_int,
     _truthy,
     redact_secrets,
+    update_dedupe_key,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class VKAdapter(BasePlatformAdapter):
+    #: Bounded backoff between failed Long Poll attempts.
+    POLL_BACKOFF_BASE = 1.0
+    POLL_BACKOFF_MAX = 60.0
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("vk"))
         extra = getattr(config, "extra", {}) or {}
@@ -95,6 +104,37 @@ class VKAdapter(BasePlatformAdapter):
             max_entries=OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
             ttl_seconds=OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
         )
+        self._seen_events = BoundedTTLCache(
+            max_entries=SEEN_EVENT_MAX_ENTRIES,
+            ttl_seconds=SEEN_EVENT_TTL_SECONDS,
+        )
+        # Long Poll health, reported truthfully rather than assumed.
+        self._poll_failures = 0
+        self._last_successful_poll: float | None = None
+        self._longpoll_degraded = False
+        self._poll_sleep = asyncio.sleep
+
+    def _longpoll_lock_identity(self) -> str:
+        """A stable, non-secret identity for the scoped Long Poll lock.
+
+        VK Bots Long Poll is per-community: two gateways consuming the same
+        community both receive every event and both answer, so the community is
+        what must be owned exclusively.  Keying on the group id alone (rather
+        than on the token) also means rotating the token while an old gateway
+        is still running is still detected as a conflict instead of silently
+        starting a second consumer.  A short token fingerprint is logged
+        separately for diagnostics; the token itself never appears anywhere.
+        """
+        return f"vk-group-{self.group_id}"
+
+    def _token_fingerprint(self) -> str:
+        """Non-reversible token marker, safe for logs and diagnostics."""
+        if not self.token:
+            return "unset"
+        return hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:12]
+
+    def _build_client(self) -> VKRestClient:
+        return VKRestClient(self.token, self.group_id, self.api_version)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token or not self.group_id:
@@ -105,25 +145,81 @@ class VKAdapter(BasePlatformAdapter):
             )
             return False
 
-        self.client = VKRestClient(self.token, self.group_id, self.api_version)
-        self.longpoll_state = await self.client.get_long_poll_state()
+        if not self._acquire_platform_lock(
+            "vk-longpoll", self._longpoll_lock_identity(), "VK community Long Poll"
+        ):
+            return False
+
+        client = self._build_client()
+        try:
+            self.longpoll_state = await client.get_long_poll_state()
+        except Exception as exc:
+            # Every failed-connect path must give the lock back, or a retry
+            # would deadlock against this same process.
+            await self._close_client(client)
+            self._release_platform_lock()
+            self._set_fatal_error(
+                "vk_longpoll_unavailable",
+                f"Cannot open VK Long Poll: {redact_secrets(exc)}",
+                retryable=is_retryable(exc) or not isinstance(exc, VKApiError),
+            )
+            return False
+
+        self.client = client
+        self._poll_failures = 0
+        self._longpoll_degraded = False
+        self._last_successful_poll = None
         self._mark_connected()
         self.poll_task = asyncio.create_task(self._poll_loop(), name="hermes-vk-longpoll")
+        self.poll_task.add_done_callback(self._on_poll_task_done)
         logger.info(
-            "VK adapter connected: group_id=%s api_version=%s", self.group_id, self.api_version
+            "VK adapter connected: group_id=%s api_version=%s token=%s reconnect=%s",
+            self.group_id,
+            self.api_version,
+            self._token_fingerprint(),
+            is_reconnect,
         )
         return True
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
-        if self.poll_task and not self.poll_task.done():
-            self.poll_task.cancel()
+        task = self.poll_task
+        if task and not task.done():
+            task.remove_done_callback(self._on_poll_task_done)
+            task.cancel()
             try:
-                await self.poll_task
+                await task
             except asyncio.CancelledError:
                 pass
-        if self.client:
-            await self.client.close()
+            except Exception:
+                logger.debug("VK Long Poll task ended with an error during shutdown")
+        self.poll_task = None
+        await self._close_client(self.client)
+        self.client = None
+        self._release_platform_lock()
+
+    @staticmethod
+    async def _close_client(client: VKRestClient | None) -> None:
+        if client is None:
+            return
+        try:
+            await client.close()
+        except Exception as exc:
+            logger.debug("VK client close failed: %s", redact_secrets(exc))
+
+    def _on_poll_task_done(self, task: asyncio.Task) -> None:
+        """A dead poll loop must never look healthy."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("VK Long Poll task terminated: %s", redact_secrets(exc))
+        self._set_fatal_error(
+            "vk_longpoll_task_failed",
+            f"VK Long Poll task stopped: {redact_secrets(exc)}",
+            retryable=True,
+        )
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         if not self.client:
@@ -370,28 +466,137 @@ class VKAdapter(BasePlatformAdapter):
                         "VK Long Poll payload: %s",
                         json.dumps(payload, ensure_ascii=False)[:4000],
                     )
+                # A response arrived: the transport is healthy again, whatever
+                # the response says.
+                self._note_poll_success()
 
                 if payload.get("failed"):
-                    await self._handle_longpoll_failed(payload)
+                    if not await self._handle_longpoll_failed(payload):
+                        return
                     continue
                 if "ts" in payload:
                     self.longpoll_state.ts = str(payload["ts"])
-                for update in payload.get("updates", []):
-                    await self._handle_update(update)
+                await self._dispatch_updates(payload.get("updates") or [])
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("VK Long Poll loop error: %s", exc)
-                await asyncio.sleep(3)
+                await self._note_poll_failure(exc)
 
-    async def _handle_longpoll_failed(self, payload: dict[str, Any]) -> None:
+    async def _dispatch_updates(self, updates: list[Any]) -> None:
+        """Dispatch each update independently.
+
+        One malformed or handler-crashing update must not cost us the rest of
+        the batch -- they are unrelated messages that happened to share a poll
+        response.
+        """
+        for update in updates:
+            if not isinstance(update, dict):
+                logger.debug("VK update ignored: not an object")
+                continue
+            if self._is_duplicate_update(update):
+                logger.debug("VK duplicate update suppressed: type=%s", update.get("type"))
+                continue
+            try:
+                await self._handle_update(update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "VK update handling failed: type=%s: %s",
+                    update.get("type"),
+                    redact_secrets(exc),
+                )
+
+    def _is_duplicate_update(self, update: dict[str, Any]) -> bool:
+        """Suppress an update already handled recently.
+
+        Bounded and in-memory on purpose: this covers redelivery inside one
+        gateway process (a `failed` recovery that rewinds `ts`, an overlapping
+        poll after a reconnect).  Recovering a backlog across a long outage
+        would need durable storage and is explicitly out of scope.
+        """
+        key = update_dedupe_key(update)
+        if key is None:
+            return False
+        if key in self._seen_events:
+            return True
+        self._seen_events.set(key, True)
+        return False
+
+    def _note_poll_success(self) -> None:
+        self._last_successful_poll = time.monotonic()
+        self._poll_failures = 0
+        if self._longpoll_degraded:
+            self._longpoll_degraded = False
+            logger.info("VK Long Poll recovered")
+            self._mark_connected()
+
+    async def _note_poll_failure(self, exc: BaseException) -> None:
+        self._poll_failures += 1
+        logger.warning(
+            "VK Long Poll failure %d: %s", self._poll_failures, redact_secrets(exc)
+        )
+        if not self._longpoll_degraded:
+            # Report degraded once per outage instead of on every retry, so the
+            # status file reflects state rather than noise.
+            self._longpoll_degraded = True
+            self._write_runtime_status_safe(
+                "longpoll_degraded",
+                platform_state="retrying",
+                error_code="vk_longpoll_unreachable",
+                error_message=redact_secrets(exc)[:200],
+            )
+        await self._poll_sleep(self._poll_backoff_delay())
+
+    def _poll_backoff_delay(self) -> float:
+        exponent = max(0, self._poll_failures - 1)
+        base = min(self.POLL_BACKOFF_BASE * (2**exponent), self.POLL_BACKOFF_MAX)
+        return min(base * (1.0 + random.random() * 0.25), self.POLL_BACKOFF_MAX)
+
+    async def _handle_longpoll_failed(self, payload: dict[str, Any]) -> bool:
+        """Apply the documented recovery for a Long Poll ``failed`` response.
+
+        Returns False when the loop must stop instead of retrying.
+
+          1  history is outdated -> keep the key, continue from the returned ts
+          2  key expired         -> request a new key, keep our ts
+          3  information lost    -> request a new key *and* ts
+          4  unsupported version -> configuration error; retrying cannot help
+        """
         assert self.client is not None
         failed = _safe_int(payload.get("failed"), 0)
-        if failed == 1 and self.longpoll_state is not None:
-            self.longpoll_state.ts = str(payload.get("ts", self.longpoll_state.ts))
-            return
-        logger.warning("VK Long Poll state refresh required: %s", payload)
+
+        if failed == 1:
+            if self.longpoll_state is not None:
+                self.longpoll_state.ts = str(payload.get("ts", self.longpoll_state.ts))
+            return True
+
+        if failed == 4:
+            self._set_fatal_error(
+                "vk_longpoll_version",
+                (
+                    "VK rejected the Long Poll API version. Set VK_API_VERSION to a "
+                    "version your community's Long Poll settings support."
+                ),
+                retryable=False,
+            )
+            return False
+
+        if failed in (2, 3):
+            previous_ts = self.longpoll_state.ts if self.longpoll_state else None
+            refreshed = await self.client.get_long_poll_state()
+            # failed=2 is only an expired key: our position in the stream is
+            # still valid, and taking VK's fresh ts would skip everything that
+            # arrived in between.
+            if failed == 2 and previous_ts is not None:
+                refreshed.ts = previous_ts
+            self.longpoll_state = refreshed
+            logger.info("VK Long Poll state refreshed after failed=%s", failed)
+            return True
+
+        logger.warning("VK Long Poll returned unknown failed=%s; refreshing state", failed)
         self.longpoll_state = await self.client.get_long_poll_state()
+        return True
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         if update.get("type") != "message_new":
