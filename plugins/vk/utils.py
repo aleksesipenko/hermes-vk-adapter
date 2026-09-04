@@ -113,3 +113,6 @@ def update_dedupe_key(update: dict[str, Any]) -> tuple[Any, ...] | None:
     if not peer_id or not (message_id or cmid):
         return None
     return (kind, peer_id, message_id, cmid)
+
+# VK accepts at most this many attachments on one messages.send call.
+VK_MAX_ATTACHMENTS = 10

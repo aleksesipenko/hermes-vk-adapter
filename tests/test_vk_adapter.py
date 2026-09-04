@@ -1022,3 +1022,163 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
     assert adapter._slash_confirm_state == {}
     assert adapter._clarify_state == {}
     assert adapter._model_picker_state == {}
+
+
+# ── complete text in normal and proactive delivery (Task 5) ───────────────
+
+
+def test_adapter_declares_native_splitting():
+    """Otherwise the delivery router truncates before send() ever runs."""
+    assert VKAdapter.splits_long_messages is True
+
+
+def test_send_limit_never_exceeds_what_vk_accepts():
+    from plugins.vk.utils import VK_MESSAGE_SEND_LIMIT
+
+    adapter = object.__new__(VKAdapter)
+    adapter.max_message_length = 99_999
+
+    assert VKAdapter._send_limit(adapter) == VK_MESSAGE_SEND_LIMIT
+
+    adapter.max_message_length = 0
+    assert VKAdapter._send_limit(adapter) > 0
+
+
+def test_chunk_text_renders_before_measuring():
+    adapter = object.__new__(VKAdapter)
+    adapter.max_message_length = 40
+
+    chunks = VKAdapter._chunk_text(adapter, "**bold** [docs](https://example.com/path)")
+
+    assert all(len(chunk) <= 40 for chunk in chunks)
+    assert not any("**" in chunk or "](" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_long_content_survives_send_completely():
+    import re
+
+    adapter = _idempotent_adapter()
+    adapter.max_message_length = 4096
+    source = "Проверка длинного текста со словами. " * 400  # noqa: RUF001
+
+    result = await VKAdapter.send(adapter, chat_id="987654321", content=source)
+
+    assert result.success
+    sent = [call["message"] for call in adapter.client.sends]
+    assert len(sent) > 3
+    assert all(len(chunk) <= 4096 for chunk in sent)
+    assert re.sub(r"\s+", "", "".join(sent)) == re.sub(r"\s+", "", source)
+
+
+@pytest.mark.asyncio
+async def test_send_result_keeps_last_id_and_ordered_continuations():
+    adapter = _idempotent_adapter()
+    adapter.max_message_length = 10
+
+    result = await VKAdapter.send(adapter, chat_id="987654321", content="alpha beta gamma delta")
+
+    ids = [str(100 + n) for n in range(1, len(adapter.client.sends) + 1)]
+    assert result.message_id == ids[-1]
+    assert list(result.continuation_message_ids) == ids[:-1]
+
+
+@pytest.mark.asyncio
+async def test_media_auto_routes_images_to_native_photos_and_others_to_documents(tmp_path):
+    adapter = _idempotent_adapter()
+    calls = []
+
+    async def fake_image(chat_id, image_path, caption=None, reply_to=None, metadata=None, **kw):
+        calls.append(("image", image_path))
+        from gateway.platforms.base import SendResult as _SR
+
+        return _SR(success=True, message_id="1")
+
+    async def fake_media(chat_id, media_files, caption="", **kw):
+        calls.append(("document", tuple(media_files)))
+        from gateway.platforms.base import SendResult as _SR
+
+        return _SR(success=True, message_id="2")
+
+    adapter.send_image_file = fake_image
+    adapter.send_media_files = fake_media
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"png")
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"pdf")
+
+    await VKAdapter.send_media_auto(adapter, "1", [str(png)], caption="c")
+    await VKAdapter.send_media_auto(adapter, "1", [str(pdf)], caption="c")
+    await VKAdapter.send_media_auto(adapter, "1", [str(png)], caption="c", force_document=True)
+
+    assert calls[0][0] == "image"
+    assert calls[1][0] == "document"
+    assert calls[2][0] == "document"
+
+
+@pytest.mark.asyncio
+async def test_photo_batches_respect_the_vk_attachment_cap():
+    from plugins.vk.utils import VK_MAX_ATTACHMENTS
+
+    adapter = _idempotent_adapter()
+    batches = [[f"photo{i}" for i in range(VK_MAX_ATTACHMENTS)], ["photo-extra"]]
+
+    result = await VKAdapter._send_attachment_batches(adapter, 5, batches, caption="hi")
+
+    assert result.success
+    sent = adapter.client.sends
+    assert len(sent) == 2
+    assert sent[0]["message"] == "hi"
+    assert sent[1]["message"] == ""
+    assert len(sent[0]["attachment"].split(",")) == VK_MAX_ATTACHMENTS
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_uses_the_adapter_path(monkeypatch):
+    """Proactive delivery must render, chunk and dedupe like a normal reply."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("VK_GROUP_TOKEN", "t" * 85)
+    monkeypatch.setenv("VK_GROUP_ID", "123456789")
+    monkeypatch.setenv("VK_MAX_MESSAGE_LENGTH", "40")
+
+    # Hermes grows a Platform member for a plugin platform when the plugin
+    # registers. Cron only ever reaches _standalone_send through that same
+    # registration, so establish the real precondition here too.
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    register(PluginContext(PluginManifest(name="vk"), PluginManager()))
+
+    from plugins.vk.adapter import _standalone_send
+
+    sends = []
+
+    class RecordingClient:
+        def __init__(self):
+            self._next = 0
+
+        def new_random_id(self):
+            self._next += 1
+            return self._next
+
+        async def send_message(self, **kwargs):
+            sends.append(kwargs)
+            return len(sends)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(VKAdapter, "_build_client", lambda self: RecordingClient())
+
+    result = await _standalone_send(
+        SimpleNamespace(extra={}, token=""),
+        "987654321",
+        "**bold** " + "word " * 40,
+    )
+
+    assert result["success"] is True
+    assert len(sends) > 1
+    assert all(len(call["message"]) <= 40 for call in sends)
+    assert all("**" not in call["message"] for call in sends)
+    assert all(call["random_id"] > 0 for call in sends)

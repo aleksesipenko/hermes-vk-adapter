@@ -36,7 +36,7 @@ from .client import (
     classify_vk_error_kind,
     is_retryable,
 )
-from .formatting import render_vk_plain_text
+from .formatting import chunk_vk_text, render_vk_plain_text
 from .keyboards import VKKeyboardFactory, model_picker_provider_text
 from .state import BoundedTTLCache
 from .utils import (
@@ -47,6 +47,8 @@ from .utils import (
     OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
     SEEN_EVENT_MAX_ENTRIES,
     SEEN_EVENT_TTL_SECONDS,
+    VK_MAX_ATTACHMENTS,
+    VK_MESSAGE_SEND_LIMIT,
     _csv_set,
     _largest_photo_url,
     _safe_int,
@@ -59,6 +61,10 @@ logger = logging.getLogger(__name__)
 
 
 class VKAdapter(BasePlatformAdapter):
+    #: send() renders and splits long content itself, so the delivery router
+    #: must hand it the full text instead of truncating first.
+    splits_long_messages = True
+
     #: Bounded backoff between failed Long Poll attempts.
     POLL_BACKOFF_BASE = 1.0
     POLL_BACKOFF_MAX = 60.0
@@ -245,10 +251,12 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
 
         try:
+            # Render first, then measure: rendering rewrites Markdown, so
+            # splitting the source would both mis-measure the result and cut
+            # links and code fences in half.
             chunks = self._chunk_text(content or "") or [""]
             sent_ids: list[str] = []
-            for index, chunk in enumerate(chunks):
-                rendered = self.format_message(chunk)
+            for index, rendered in enumerate(chunks):
                 current_reply_to = reply_to if index == 0 else None
                 first_chunk = index == 0
                 keyboard = (
@@ -374,6 +382,139 @@ class VKAdapter(BasePlatformAdapter):
                 metadata=metadata,
                 **kwargs,
             )
+
+    @staticmethod
+    def _is_vk_photo_path(path: str) -> bool:
+        return os.path.splitext(path)[1].lower() in VK_MESSAGE_PHOTO_MIME_TYPES
+
+    async def send_media_auto(
+        self,
+        chat_id: str,
+        media_files: list[str],
+        *,
+        caption: str = "",
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        force_document: bool = False,
+    ) -> SendResult:
+        """Route files to the right VK surface: photos as photos, rest as docs.
+
+        One entry point so proactive delivery and normal replies cannot drift
+        apart on media handling.
+        """
+        files = [path for path in (media_files or []) if path]
+        if not files:
+            return await self.send(chat_id, caption or "", reply_to=reply_to, metadata=metadata)
+        if not force_document and all(self._is_vk_photo_path(path) for path in files):
+            if len(files) == 1:
+                return await self.send_image_file(
+                    chat_id,
+                    files[0],
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return await self.send_photo_files(
+                chat_id, files, caption=caption, reply_to=reply_to, metadata=metadata
+            )
+        return await self.send_media_files(
+            chat_id, files, caption or "", reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_photo_files(
+        self,
+        chat_id: str,
+        image_paths: list[str],
+        *,
+        caption: str = "",
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Send several images as native VK photos, batched to VK's cap.
+
+        Falls back to the document path for the whole set if any upload fails,
+        so the user still receives the files.
+        """
+        if not self.client:
+            return SendResult(success=False, error="VK adapter is not connected", retryable=True)
+        peer_id = _safe_int(chat_id)
+        if not peer_id:
+            return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
+
+        try:
+            refs = [
+                await self.client.upload_photo_message_raw(peer_id=peer_id, path=path)
+                for path in image_paths
+            ]
+        except (VKApiError, RuntimeError, OSError, ValueError, httpx.HTTPError) as exc:
+            logger.warning(
+                "VK native photo batch failed peer_id=%s; using document fallback: %s",
+                peer_id,
+                redact_secrets(exc),
+            )
+            return await self.send_media_files(
+                chat_id,
+                image_paths,
+                caption or "",
+                file_names=[os.path.basename(path) for path in image_paths],
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        batches = [
+            refs[start : start + VK_MAX_ATTACHMENTS]
+            for start in range(0, len(refs), VK_MAX_ATTACHMENTS)
+        ]
+        return await self._send_attachment_batches(
+            peer_id, batches, caption=caption, reply_to=reply_to
+        )
+
+    async def _send_attachment_batches(
+        self,
+        peer_id: int,
+        batches: list[list[str]],
+        *,
+        caption: str = "",
+        reply_to: str | None = None,
+    ) -> SendResult:
+        """Send attachment batches, carrying the caption on the first one."""
+        caption_chunks = self._chunk_text(caption or "")
+        sent_ids: list[str] = []
+        try:
+            for index, batch in enumerate(batches):
+                text = caption_chunks[0] if (index == 0 and caption_chunks) else ""
+                attachment = ",".join(batch)
+                random_id = self._chunk_random_id(peer_id, index, f"{attachment}\x00{text}")
+                send_kwargs: dict[str, Any] = {
+                    "peer_id": peer_id,
+                    "message": text,
+                    "attachment": attachment,
+                    "random_id": random_id,
+                }
+                if index == 0 and reply_to:
+                    send_kwargs["reply_to"] = reply_to
+                sent_ids.append(str(await self.client.send_message(**send_kwargs)))
+
+            # A caption longer than one message still has to arrive in full.
+            for offset, chunk in enumerate(caption_chunks[1:], start=len(batches)):
+                sent_ids.append(
+                    str(
+                        await self.client.send_message(
+                            peer_id=peer_id,
+                            message=chunk,
+                            random_id=self._chunk_random_id(peer_id, offset, chunk),
+                        )
+                    )
+                )
+        except Exception as exc:
+            logger.exception("VK attachment send failed peer_id=%s", peer_id)
+            return self._failed_send(exc)
+
+        return SendResult(
+            success=True,
+            message_id=sent_ids[-1] if sent_ids else None,
+            continuation_message_ids=tuple(sent_ids[:-1]),
+        )
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         peer_id = _safe_int(chat_id)
@@ -819,22 +960,16 @@ class VKAdapter(BasePlatformAdapter):
     def _model_keyboard(self, provider: dict[str, Any], provider_index: int, page: int = 0) -> str:
         return self._keyboard_factory().model_keyboard(provider, provider_index, page)
 
+    def _send_limit(self) -> int:
+        """Per-chunk character budget, never above what VK will accept."""
+        configured = _safe_int(self.max_message_length, DEFAULT_MAX_MESSAGE_LENGTH)
+        if configured < 1:
+            configured = DEFAULT_MAX_MESSAGE_LENGTH
+        return min(configured, VK_MESSAGE_SEND_LIMIT)
+
     def _chunk_text(self, text: str) -> list[str]:
-        if len(text) <= self.max_message_length:
-            return [text] if text else []
-        chunks: list[str] = []
-        remaining = text
-        while remaining:
-            chunk = remaining[: self.max_message_length]
-            split_at = max(chunk.rfind("\n\n"), chunk.rfind("\n"), chunk.rfind(" "))
-            if split_at > self.max_message_length * 0.4:
-                chunk = chunk[:split_at]
-            chunk = chunk.strip()
-            if not chunk:
-                chunk = remaining[: self.max_message_length]
-            chunks.append(chunk)
-            remaining = remaining[len(chunk) :].strip()
-        return chunks
+        """Render to VK plain text, then split it into sendable chunks."""
+        return chunk_vk_text(self.format_message(text or ""), self._send_limit())
 
     def _chunk_random_id(self, peer_id: int, index: int, rendered: str) -> int:
         """A ``random_id`` that is stable across retries of one logical chunk.
@@ -1004,31 +1139,38 @@ async def _standalone_send(
     media_files: list[str] | None = None,
     force_document: bool = False,
 ) -> dict[str, Any]:
-    extra = getattr(pconfig, "extra", {}) or {}
-    token = os.getenv("VK_GROUP_TOKEN") or getattr(pconfig, "token", "") or extra.get("token", "")
-    group_id = _safe_int(os.getenv("VK_GROUP_ID") or extra.get("group_id"), 0)
-    api_version = os.getenv("VK_API_VERSION") or extra.get("api_version") or DEFAULT_API_VERSION
-    peer_id = _safe_int(chat_id, 0)
-    if not token or not group_id or not peer_id:
+    """Cron / proactive delivery.
+
+    Built on a real ``VKAdapter`` rather than a second, weaker transport: this
+    path used to send ``message`` unrendered, unsplit, and with every image
+    forced through the document uploader, so a long cron report arrived
+    truncated by VK and screenshots arrived as file attachments. Reusing the
+    adapter means proactive delivery gets the same rendering, chunking,
+    idempotency and native-photo handling as a normal reply, by construction.
+    """
+    adapter = VKAdapter(pconfig)
+    if not adapter.token or not adapter.group_id or not _safe_int(chat_id, 0):
         return {"error": "VK standalone send missing token/group_id/peer_id"}
 
-    client = VKRestClient(token, group_id, api_version)
+    adapter.client = adapter._build_client()
     try:
-        attachment = None
         if media_files:
-            refs = [
-                await client.upload_document_raw(peer_id=peer_id, path=path)
-                for path in media_files
-            ]
-            attachment = ",".join(refs)
-        response = await client.send_message(
-            peer_id=peer_id, message=message, attachment=attachment
-        )
-        return {"success": True, "message_id": str(response)}
+            result = await adapter.send_media_auto(
+                chat_id,
+                media_files,
+                caption=message or "",
+                force_document=force_document,
+            )
+        else:
+            result = await adapter.send(chat_id, message or "")
+        if not result.success:
+            return {"error": result.error or "VK standalone send failed"}
+        return {"success": True, "message_id": result.message_id}
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": redact_secrets(exc)}
     finally:
-        await client.close()
+        await VKAdapter._close_client(adapter.client)
+        adapter.client = None
 
 
 def check_requirements() -> bool:
