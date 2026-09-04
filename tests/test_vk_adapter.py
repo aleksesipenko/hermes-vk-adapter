@@ -950,3 +950,68 @@ async def test_send_failure_message_never_carries_a_token():
 
     assert not result.success
     assert token not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_interactive_surfaces_report_typed_failures_and_drop_their_state():
+    """Every interactive surface shares send()'s failure classification.
+
+    These four paths each have their own ``except`` block, so a helper renamed
+    in ``send()`` alone leaves them raising ``AttributeError`` from inside the
+    handler that was supposed to report the failure -- the surface then dies
+    with an unhandled exception instead of a clean, retryable SendResult.
+    """
+    import httpx
+
+    adapter = _idempotent_adapter()
+
+    class DownClient(type(adapter.client)):
+        async def send_message(self, **kwargs):
+            raise httpx.ConnectError("connection refused")
+
+    from plugins.vk.keyboards import VKKeyboardFactory
+
+    adapter.client = DownClient()
+    adapter._keyboards = VKKeyboardFactory()
+    adapter._approval_counter = 0
+    adapter._approval_state = {}
+    adapter._slash_confirm_state = {}
+    adapter._clarify_state = {}
+    adapter._model_picker_state = {}
+
+    results = [
+        await VKAdapter.send_exec_approval(
+            adapter, chat_id="987654321", command="rm -rf /", session_key="s"
+        ),
+        await VKAdapter.send_slash_confirm(
+            adapter, chat_id="987654321", title="t", message="m", session_key="s", confirm_id="c"
+        ),
+        await VKAdapter.send_clarify(
+            adapter,
+            chat_id="987654321",
+            question="q",
+            choices=["a", "b"],
+            clarify_id="cl",
+            session_key="s",
+        ),
+        await VKAdapter.send_model_picker(
+            adapter,
+            chat_id="987654321",
+            providers=[{"slug": "p", "name": "P", "models": ["m"]}],
+            current_model="m",
+            current_provider="p",
+            session_key="s",
+            on_model_selected=None,
+        ),
+    ]
+
+    for result in results:
+        assert not result.success
+        assert result.retryable is True
+        assert result.error_kind == "transient"
+
+    # Pending state must not survive a send that never reached the user.
+    assert adapter._approval_state == {}
+    assert adapter._slash_confirm_state == {}
+    assert adapter._clarify_state == {}
+    assert adapter._model_picker_state == {}
