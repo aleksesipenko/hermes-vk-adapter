@@ -10,8 +10,14 @@ https://github.com/aleksesipenko/hermes-vk-adapter#readme
 
 ```bash
 hermes plugins list
+hermes vk-doctor          # локальная проверка конфигурации
+hermes vk-doctor --live   # read-only проверка токена и Long Poll
 hermes gateway status
 ```
+
+`hermes vk-doctor --live` отличает «плагин импортировался» от «VK реально
+готов»: права токена, включённый Long Poll и нужные события. Ничего не
+отправляет.
 
 Чеклист настройки VK:
 

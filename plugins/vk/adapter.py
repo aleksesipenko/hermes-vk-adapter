@@ -1544,3 +1544,14 @@ def register(ctx: Any) -> None:
         emoji="VK",
         standalone_sender_fn=_standalone_send,
     )
+
+    # `hermes vk-doctor` -- read-only by default. Imported lazily so argparse
+    # wiring never runs at plugin-import time.
+    from . import doctor as _doctor
+
+    ctx.register_cli_command(
+        name="vk-doctor",
+        help="Diagnose the VK adapter (local by default; --live adds read-only VK checks)",
+        setup_fn=_doctor.register_cli,
+        handler_fn=_doctor.dispatch,
+    )

@@ -198,6 +198,41 @@ hermes gateway status
 беседы slash-команды должны работать без mention, а обычный текст должен
 требовать mention, reply или другой activation signal.
 
+## Диагностика: hermes vk-doctor
+
+`hermes plugins list` и `hermes gateway status` показывают только то, что
+плагин импортировался и переменные окружения заданы. Этого мало: токен может
+быть отозван, Long Poll выключен, а gateway всё равно покажет «connected».
+
+```bash
+hermes vk-doctor              # только локальные проверки, без сети
+hermes vk-doctor --live       # + read-only проверки VK
+hermes vk-doctor --live --json
+```
+
+Локальный режим проверяет форму конфигурации: токен задан (значение не
+печатается), `VK_GROUP_ID` — положительное число, `VK_API_VERSION` вида `5.199`.
+
+`--live` дополнительно делает только читающие вызовы:
+
+- `groups.getTokenPermissions` — есть ли `messages`, `manage`, `docs`, `photos`;
+  лишние права показываются как предупреждение (least privilege);
+- `groups.getLongPollSettings` — включён ли Long Poll, есть ли события
+  `message_new` и `message_event`, совпадает ли версия с `VK_API_VERSION`;
+- `groups.getLongPollServer` — доступность;
+- `messages.getConversationsById` — виден ли `VK_HOME_PEER_ID`.
+
+Ничего не отправляется и не изменяется. Отправка возможна только явно:
+
+```bash
+hermes vk-doctor --live --send-smoke --peer-id <peer>
+```
+
+Без `--peer-id` команда откажется угадывать адресата.
+
+Коды выхода: `0` — всё в порядке, `1` — есть предупреждения, `2` — есть ошибки.
+Токен не печатается ни в одном режиме, включая тексты ошибок VK.
+
 ## Реакции, отметка о прочтении, edit и delete
 
 Hermes умеет редактировать и удалять свои VK-сообщения через `messages.edit` и

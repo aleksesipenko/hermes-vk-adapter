@@ -241,6 +241,9 @@ def test_register_provides_platform_hooks():
         def register_platform(self, **kwargs):
             self.kwargs = kwargs
 
+        def register_cli_command(self, **kwargs):
+            pass
+
     ctx = Ctx()
     register(ctx)
 
