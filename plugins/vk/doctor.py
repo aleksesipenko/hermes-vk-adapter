@@ -198,13 +198,33 @@ async def run_live_checks(
     return results
 
 
+def _permission_names(permissions: Any) -> set[str]:
+    """Scope names out of ``groups.getTokenPermissions``, whichever shape VK used.
+
+    5.199 answers with ``{"mask": N, "permissions": [{"name": "photos",
+    "setting": 4}, ...]}``; older responses carry the same objects under
+    ``settings``. Only the ``name`` string is meaningful to us -- the numeric
+    ``setting`` is VK's bitmask for the same scope. Anything unrecognised is
+    dropped rather than guessed at, so a shape we do not understand reads as
+    "no scopes proven" instead of a false green.
+    """
+    if not isinstance(permissions, dict):
+        return set()
+    entries = permissions.get("permissions")
+    if not isinstance(entries, (list, tuple)):
+        entries = permissions.get("settings")
+    if not isinstance(entries, (list, tuple)):
+        return set()
+    names: set[str] = set()
+    for entry in entries:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
 def _check_permissions(permissions: Any) -> CheckResult:
-    settings = (permissions or {}).get("settings")
-    granted = {
-        str(entry.get("name"))
-        for entry in (settings or [])
-        if isinstance(entry, dict) and entry.get("name")
-    }
+    granted = _permission_names(permissions)
     if not granted:
         return CheckResult(
             "token_permissions", "fail", "groups.getTokenPermissions listed no scopes"

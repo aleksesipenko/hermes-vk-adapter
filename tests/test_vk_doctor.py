@@ -119,6 +119,31 @@ async def test_a_healthy_community_reports_all_ok():
     assert DoctorReport(results).exit_code == EXIT_OK
 
 
+#: Verbatim payload a live 5.199 community token returns for
+#: ``groups.getTokenPermissions``: the scopes sit under ``permissions``, not
+#: ``settings``, which used to make the parser report "no scopes" on a token
+#: that was in fact fully provisioned.
+LIVE_5_199_TOKEN_PERMISSIONS = {
+    "mask": 397316,
+    "permissions": [
+        {"name": "photos", "setting": 4},
+        {"name": "messages", "setting": 4096},
+        {"name": "docs", "setting": 131072},
+        {"name": "manage", "setting": 262144},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_live_5_199_permission_objects_satisfy_the_required_scopes():
+    client = healthy_client(**{"groups.getTokenPermissions": LIVE_5_199_TOKEN_PERMISSIONS})
+
+    results = await run_live_checks(client)
+
+    assert statuses(results)["token_permissions"] == "ok"
+    assert DoctorReport(results).exit_code == EXIT_OK
+
+
 @pytest.mark.asyncio
 async def test_a_missing_scope_is_reported_as_a_failure():
     client = healthy_client(
