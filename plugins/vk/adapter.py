@@ -21,10 +21,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_audio_from_url,
+    cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
-    cache_image_from_url,
 )
 
 from .attachments import summarize_attachment, summarize_message_context
@@ -53,8 +52,6 @@ from .utils import (
     LAST_ACTOR_TTL_SECONDS,
     MAX_INBOUND_ATTACHMENTS,
     MAX_INBOUND_DOWNLOAD_BYTES,
-    OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
-    OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
     SEEN_EVENT_MAX_ENTRIES,
     SEEN_EVENT_TTL_SECONDS,
     VK_MAX_ATTACHMENTS,
@@ -70,14 +67,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _file_size(path: str) -> int:
-    """Size of a cached download, or 0 when it cannot be measured."""
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
 
 
 def _describe_payload(payload: Any) -> str:
@@ -105,6 +94,13 @@ class VKAdapter(BasePlatformAdapter):
     #: send() renders and splits long content itself, so the delivery router
     #: must hand it the full text instead of truncating first.
     splits_long_messages = True
+
+    #: Class-level "off" defaults for the cosmetic reaction lifecycle. __init__
+    #: replaces them with the configured values; leaving them here means an
+    #: adapter that never ran __init__ degrades to "no reactions" rather than
+    #: raising from a decorative code path.
+    reactions = ReactionConfig()
+    _cmid_by_anchor = None
 
     #: Bounded backoff between failed Long Poll attempts.
     POLL_BACKOFF_BASE = 1.0
@@ -150,9 +146,11 @@ class VKAdapter(BasePlatformAdapter):
         self._approval_counter = 0
         # One bounded, expiring, actor-bound store for every interactive prompt.
         self._interactive = InteractiveStore()
-        # The cmid of the last inbound message per peer -- VK keys reactions on
-        # conversation_message_id, never on the global message id.
-        self._last_inbound_cmid = BoundedTTLCache(
+        # (peer, reply anchor) -> cmid of the message that triggered the turn.
+        # VK keys reactions on conversation_message_id, and core hands the
+        # anchor back to send() as reply_to, so a reaction can be tied to the
+        # exact message it answers instead of to "whoever spoke here last".
+        self._cmid_by_anchor = BoundedTTLCache(
             max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
         )
         # What each peer's client can render, and who the peers actually are.
@@ -163,10 +161,6 @@ class VKAdapter(BasePlatformAdapter):
             max_entries=IDENTITY_MAX_ENTRIES, ttl_seconds=IDENTITY_TTL_SECONDS
         )
         self._keyboards = VKKeyboardFactory()
-        self._outbound_random_ids = BoundedTTLCache(
-            max_entries=OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
-            ttl_seconds=OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
-        )
         self._seen_events = BoundedTTLCache(
             max_entries=SEEN_EVENT_MAX_ENTRIES,
             ttl_seconds=SEEN_EVENT_TTL_SECONDS,
@@ -342,7 +336,7 @@ class VKAdapter(BasePlatformAdapter):
                         random_id=random_id,
                     )
                 sent_ids.append(str(response))
-            await self._react_done(peer_id)
+            await self._react_done(peer_id, reply_to)
             return SendResult(
                 success=True,
                 message_id=sent_ids[-1] if sent_ids else None,
@@ -350,7 +344,7 @@ class VKAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("VK send failed peer_id=%s", peer_id)
-            await self._react_failed(peer_id)
+            await self._react_failed(peer_id, reply_to)
             return self._failed_send(exc)
 
     async def send_document(
@@ -490,10 +484,6 @@ class VKAdapter(BasePlatformAdapter):
     def _slash_confirm_fallback_text(self) -> str:
         prefix = getattr(self, "typed_command_prefix", "/")
         return f"Reply {prefix}approve to confirm, or {prefix}deny to cancel."
-
-    def _model_picker_fallback_text(self) -> str:
-        prefix = getattr(self, "typed_command_prefix", "/")
-        return f"Reply {prefix}model <model-id> to switch models."
 
     def _clarify_fallback_text(self, choices: list) -> str:
         lines = [f"{index}. {choice}" for index, choice in enumerate(choices[:8], start=1)]
@@ -662,26 +652,34 @@ class VKAdapter(BasePlatformAdapter):
             return
         await self._react(peer_id, cmid, reaction_id)
 
-    async def _react_failed(self, peer_id: int) -> None:
-        """Mark the inbound message when *our own* delivery failed.
+    def _trigger_cmid(self, peer_id: int, reply_to: Any) -> int:
+        """The cmid of the message this delivery answers, or 0 if unprovable.
 
-        This is the only failure the adapter can honestly observe. Hermes
-        exposes no agent-run-failed hook to a platform adapter, so this never
-        claims to reflect whether the agent itself succeeded.
+        Only the reply anchor core gives us identifies the turn. Falling back
+        to "the last inbound message in this peer" reacted to the wrong
+        message whenever a second user spoke first, and reacted to a stale
+        message for proactive sends that answer nothing.
+        """
+        if not reply_to or not peer_id or self._cmid_by_anchor is None:
+            return 0
+        return _safe_int(self._cmid_by_anchor.get((peer_id, str(reply_to))), 0)
+
+    async def _react_failed(self, peer_id: int, reply_to: Any = None) -> None:
+        """Mark the triggering message when *our own* delivery failed.
+
+        This is the only failure the adapter can honestly observe: Hermes
+        exposes no agent-run-failed hook to a platform adapter.
         """
         reaction_id = self.reactions.failed
-        if not reaction_id or not self.client:
+        cmid = self._trigger_cmid(peer_id, reply_to)
+        if not reaction_id or not self.client or not cmid:
             return
-        cmid = _safe_int(self._last_inbound_cmid.get(peer_id), 0)
-        if cmid:
-            await self._react(peer_id, cmid, reaction_id)
+        await self._react(peer_id, cmid, reaction_id)
 
-    async def _react_done(self, peer_id: int) -> None:
+    async def _react_done(self, peer_id: int, reply_to: Any = None) -> None:
         """Close out the lifecycle reaction on the message we replied to."""
-        if not self.reactions.enabled or not self.client:
-            return
-        cmid = _safe_int(self._last_inbound_cmid.get(peer_id), 0)
-        if not cmid:
+        cmid = self._trigger_cmid(peer_id, reply_to)
+        if not self.reactions.enabled or not self.client or not cmid:
             return
         if self.reactions.done:
             await self._react(peer_id, cmid, self.reactions.done)
@@ -891,6 +889,7 @@ class VKAdapter(BasePlatformAdapter):
                     message=caption,
                     attachment=",".join(refs),
                 )
+            await self._react_done(peer_id, reply_to)
             return SendResult(success=True, message_id=str(response))
         except VKApiError as exc:
             error = self._media_vk_api_error(exc)
@@ -898,9 +897,11 @@ class VKAdapter(BasePlatformAdapter):
                 logger.exception("VK media send failed peer_id=%s", peer_id)
             else:
                 logger.warning("VK media send failed peer_id=%s: %s", peer_id, error)
+            await self._react_failed(peer_id, reply_to)
             return self._failed_send(exc, error=error)
         except Exception as exc:
             logger.exception("VK media send failed peer_id=%s", peer_id)
+            await self._react_failed(peer_id, reply_to)
             return self._failed_send(exc)
 
     @staticmethod
@@ -1109,8 +1110,10 @@ class VKAdapter(BasePlatformAdapter):
         # their message.
         self._remember_capabilities(peer_id, client_info or message.get("client_info"))
         inbound_cmid = _safe_int(message.get("conversation_message_id"), 0)
-        if inbound_cmid:
-            self._last_inbound_cmid.set(peer_id, inbound_cmid)
+        if inbound_cmid and msg_id:
+            # msg_id is exactly what lands on MessageEvent.message_id, which is
+            # what core's _reply_anchor_for_event returns for VK.
+            self._cmid_by_anchor.set((peer_id, str(msg_id)), inbound_cmid)
         await self._mark_read(peer_id, _safe_int(message.get("id"), 0))
         await self._react_processing(peer_id, inbound_cmid)
 
@@ -1192,9 +1195,12 @@ class VKAdapter(BasePlatformAdapter):
                 if kind == "photo":
                     url = _largest_photo_url(attachment.get("photo") or {})
                     if url:
-                        path = await cache_image_from_url(url, ext=".jpg")
-                        downloaded_bytes += _file_size(path)
-                        media_paths.append(path)
+                        assert self.client is not None
+                        data = await self.client.download_bytes(
+                            url, max_bytes=MAX_INBOUND_DOWNLOAD_BYTES - downloaded_bytes
+                        )
+                        downloaded_bytes += len(data)
+                        media_paths.append(cache_image_from_bytes(data, ".jpg"))
                         media_types.append("image/jpeg")
                         inferred = MessageType.PHOTO
                 elif kind == "doc":
@@ -1234,9 +1240,12 @@ class VKAdapter(BasePlatformAdapter):
                     url = audio.get("link_ogg") or audio.get("link_mp3")
                     if url:
                         ext = ".ogg" if audio.get("link_ogg") else ".mp3"
-                        path = await cache_audio_from_url(url, ext=ext)
-                        downloaded_bytes += _file_size(path)
-                        media_paths.append(path)
+                        assert self.client is not None
+                        data = await self.client.download_bytes(
+                            url, max_bytes=MAX_INBOUND_DOWNLOAD_BYTES - downloaded_bytes
+                        )
+                        downloaded_bytes += len(data)
+                        media_paths.append(cache_audio_from_bytes(data, ext))
                         media_types.append("audio/ogg" if ext == ".ogg" else "audio/mpeg")
                         inferred = MessageType.VOICE
                 else:
@@ -1575,31 +1584,39 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
-        picker_id = secrets.token_hex(4)
         actor, use_callbacks = self._interactive_binding(peer_id, session_key)
-        text = model_picker_provider_text(providers, current_model, current_provider)
-        if use_callbacks:
-            self._interactive.register(
-                kind=PICKER_KIND,
-                action_id=picker_id,
-                user_id=actor,
-                peer_id=peer_id,
-                session_key=session_key,
-                data={
-                    "providers": providers,
-                    "on_model_selected": on_model_selected,
-                    "current_model": current_model,
-                    "current_provider": current_provider,
-                    "provider_page": 0,
-                },
+        if not use_callbacks:
+            # Nothing is sent. gateway/slash_commands.py only returns early on
+            # result.success, so a non-success hands /model back to core, which
+            # renders its own list -- with real model IDs and usage -- instead
+            # of our provider-name-only picker that no one could act on.
+            return SendResult(
+                success=False,
+                error="VK client cannot render a callback picker; use the core text fallback",
+                retryable=False,
+                error_kind="unknown",
             )
-        else:
-            text = f"{text}\n\n{self._model_picker_fallback_text()}"
+
+        picker_id = secrets.token_hex(4)
+        self._interactive.register(
+            kind=PICKER_KIND,
+            action_id=picker_id,
+            user_id=actor,
+            peer_id=peer_id,
+            session_key=session_key,
+            data={
+                "providers": providers,
+                "on_model_selected": on_model_selected,
+                "current_model": current_model,
+                "current_provider": current_provider,
+                "provider_page": 0,
+            },
+        )
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
-                message=text,
-                keyboard=self._provider_keyboard(providers, picker_id) if use_callbacks else None,
+                message=model_picker_provider_text(providers, current_model, current_provider),
+                keyboard=self._provider_keyboard(providers, picker_id),
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:

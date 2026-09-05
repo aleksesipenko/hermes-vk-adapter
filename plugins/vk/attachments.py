@@ -19,6 +19,9 @@ from typing import Any
 
 MAX_SUMMARY_CHARS = 200
 
+#: Appended verbatim whenever any bound dropped content.
+TRUNCATION_MARKER = "[context truncated]"
+
 
 @dataclass(frozen=True)
 class ContextLimits:
@@ -206,6 +209,11 @@ def _summarize_one(
 def summarize_message_context(message: dict[str, Any], limits: ContextLimits | None = None) -> str:
     """Bounded plain-text rendering of a message's reply/forward context.
 
+    ``max_text_chars`` is a cap on the **whole returned string** -- labels,
+    attachment summaries and the truncation marker included -- not just on the
+    message bodies inside it. Charging only the bodies let a 120-character
+    budget return 900+ characters of rendered output.
+
     Returns an empty string when there is no quoted context at all.
     """
     limits = limits or ContextLimits()
@@ -226,6 +234,33 @@ def summarize_message_context(message: dict[str, Any], limits: ContextLimits | N
 
     if not lines:
         return ""
-    if budget.truncated:
-        lines.append("[context truncated]")
-    return "\n".join(lines)
+    return _fit(lines, budget.truncated, limits.max_text_chars)
+
+
+def _fit(lines: list[str], truncated: bool, limit: int) -> str:
+    """Join ``lines`` into at most ``limit`` characters, truthfully.
+
+    When anything is dropped -- by an earlier budget or by this final fit --
+    room for the marker is reserved first, so the marker is never itself the
+    thing that pushes the result over the limit.
+    """
+    rendered = "\n".join(lines)
+    if not truncated and len(rendered) <= limit:
+        return rendered
+
+    room = limit - len(TRUNCATION_MARKER) - 1  # -1 for the joining newline
+    if room <= 0:
+        # No room for content plus a marker: say only that context was dropped.
+        return TRUNCATION_MARKER[:limit]
+
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > room:
+            break
+        kept.append(line)
+        used += cost
+    if not kept:
+        return TRUNCATION_MARKER[:limit]
+    return "\n".join([*kept, TRUNCATION_MARKER])

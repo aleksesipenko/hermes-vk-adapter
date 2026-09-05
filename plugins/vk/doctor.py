@@ -119,11 +119,22 @@ def run_local_checks(env: dict[str, str] | None = None) -> list[CheckResult]:
         )
 
     home = str(source.get("VK_HOME_PEER_ID") or "").strip()
-    results.append(
-        CheckResult("home_peer_id", "ok", f"VK_HOME_PEER_ID={home}")
-        if home
-        else CheckResult("home_peer_id", "skip", "VK_HOME_PEER_ID is not set (cron delivery off)")
-    )
+    if not home:
+        results.append(
+            CheckResult("home_peer_id", "skip", "VK_HOME_PEER_ID is not set (cron delivery off)")
+        )
+    elif _positive_int(home):
+        results.append(CheckResult("home_peer_id", "ok", f"VK_HOME_PEER_ID={home}"))
+    else:
+        # A configured-but-unusable value is worse than an absent one: cron
+        # delivery is switched on and silently goes nowhere.
+        results.append(
+            CheckResult(
+                "home_peer_id",
+                "fail",
+                "VK_HOME_PEER_ID must be a positive numeric VK peer id",
+            )
+        )
     return results
 
 

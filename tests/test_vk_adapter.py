@@ -285,12 +285,20 @@ def test_format_message_renders_vk_plain_text():
 async def test_extract_audio_message_routes_voice_for_gateway_stt(monkeypatch):
     adapter = object.__new__(VKAdapter)
 
-    async def fake_cache_audio_from_url(url: str, ext: str = ".ogg"):
-        assert url == "https://vk.example/voice.ogg"
+    class FakeClient:
+        async def download_bytes(self, url: str, *, max_bytes: int | None = None):
+            assert url == "https://vk.example/voice.ogg"
+            assert max_bytes and max_bytes > 0, "download must be bounded by the budget"
+            return b"OggS-fake-voice"
+
+    adapter.client = FakeClient()
+
+    def fake_cache_audio_from_bytes(data: bytes, ext: str = ".ogg"):
+        assert data == b"OggS-fake-voice"
         assert ext == ".ogg"
         return "/tmp/vk-voice.ogg"
 
-    monkeypatch.setattr("plugins.vk.adapter.cache_audio_from_url", fake_cache_audio_from_url)
+    monkeypatch.setattr("plugins.vk.adapter.cache_audio_from_bytes", fake_cache_audio_from_bytes)
 
     media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
@@ -306,12 +314,20 @@ async def test_extract_audio_message_routes_voice_for_gateway_stt(monkeypatch):
 async def test_extract_photo_routes_image_for_gateway_vision(monkeypatch):
     adapter = object.__new__(VKAdapter)
 
-    async def fake_cache_image_from_url(url: str, ext: str = ".jpg"):
-        assert url == "https://vk.example/photo-large.jpg"
+    class FakeClient:
+        async def download_bytes(self, url: str, *, max_bytes: int | None = None):
+            assert url == "https://vk.example/photo-large.jpg"
+            assert max_bytes and max_bytes > 0, "download must be bounded by the budget"
+            return b"\xff\xd8\xff-fake-jpeg"
+
+    adapter.client = FakeClient()
+
+    def fake_cache_image_from_bytes(data: bytes, ext: str = ".jpg"):
+        assert data == b"\xff\xd8\xff-fake-jpeg"
         assert ext == ".jpg"
         return "/tmp/vk-photo.jpg"
 
-    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", fake_cache_image_from_url)
+    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_bytes", fake_cache_image_from_bytes)
 
     media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
@@ -437,7 +453,7 @@ async def test_group_slash_command_bypasses_mention_and_uses_command_type():
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
-    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._cmid_by_anchor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._capabilities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter.client = None  # identity lookups degrade to numeric labels
@@ -480,7 +496,7 @@ async def test_group_reply_to_bot_activates_plain_text_message():
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
-    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._cmid_by_anchor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._capabilities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter.client = None  # identity lookups degrade to numeric labels
@@ -652,7 +668,7 @@ def _idempotent_adapter():
     adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
     adapter._interactive = InteractiveStore()
     adapter._last_actor = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
-    adapter._last_inbound_cmid = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._cmid_by_anchor = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter.reactions = ReactionConfig()
@@ -810,13 +826,28 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
     adapter.client = DownClient()
     adapter._keyboards = VKKeyboardFactory()
     adapter._approval_counter = 0
+    # Capable client + DM peer, so every surface reaches the transport and the
+    # failure under test is the send itself, not a capability gate.
+    VKAdapter._remember_capabilities(
+        adapter,
+        987654321,
+        {"button_actions": ["text", "callback"], "keyboard": True, "inline_keyboard": True},
+    )
 
     results = [
         await VKAdapter.send_exec_approval(
-            adapter, chat_id="987654321", command="rm -rf /", session_key="s"
+            adapter,
+            chat_id="987654321",
+            command="rm -rf /",
+            session_key="agent:main:vk:dm:987654321",
         ),
         await VKAdapter.send_slash_confirm(
-            adapter, chat_id="987654321", title="t", message="m", session_key="s", confirm_id="c"
+            adapter,
+            chat_id="987654321",
+            title="t",
+            message="m",
+            session_key="agent:main:vk:dm:987654321",
+            confirm_id="c",
         ),
         await VKAdapter.send_clarify(
             adapter,
@@ -824,7 +855,7 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
             question="q",
             choices=["a", "b"],
             clarify_id="cl",
-            session_key="s",
+            session_key="agent:main:vk:dm:987654321",
         ),
         await VKAdapter.send_model_picker(
             adapter,
@@ -832,7 +863,7 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
             providers=[{"slug": "p", "name": "P", "models": ["m"]}],
             current_model="m",
             current_provider="p",
-            session_key="s",
+            session_key="agent:main:vk:dm:987654321",
             on_model_selected=None,
         ),
     ]
@@ -869,7 +900,7 @@ async def _capture_inbound(adapter, message):
     adapter.allowed_users = set()
     adapter.mark_read_enabled = False
     adapter._last_actor = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
-    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
+    adapter._cmid_by_anchor = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
     adapter._capabilities = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
     adapter._identities = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
     adapter.reactions = _ReactionConfig()
@@ -932,10 +963,11 @@ async def test_an_unsupported_attachment_is_described_instead_of_dropped(monkeyp
 async def test_one_failing_attachment_preserves_the_others(monkeypatch):
     adapter = object.__new__(VKAdapter)
 
-    async def exploding_cache(url, ext=".jpg"):
-        raise RuntimeError("download failed")
+    class ExplodingClient:
+        async def download_bytes(self, url, *, max_bytes=None):
+            raise RuntimeError("download failed")
 
-    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", exploding_cache)
+    adapter.client = ExplodingClient()
 
     media_paths, _types, _kind, notes = await VKAdapter._extract_media(
         adapter,

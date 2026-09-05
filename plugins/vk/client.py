@@ -25,6 +25,24 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _reject_unsafe_url(url: str) -> None:
+    """Refuse a URL that points at a private or internal address.
+
+    Reuses Hermes' own URL safety check when it is importable (the gateway
+    always has it). Without Hermes -- standalone tests, the doctor -- the
+    scheme check below still rejects the non-HTTP targets that make SSRF
+    interesting.
+    """
+    if not str(url or "").lower().startswith(("http://", "https://")):
+        raise ValueError("VK attachment URL must be http(s)")
+    try:
+        from tools.url_safety import is_safe_url
+    except Exception:
+        return
+    if not is_safe_url(url):
+        raise ValueError("Blocked VK attachment URL pointing at a private address")
+
 VK_MESSAGE_PHOTO_MIME_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -288,7 +306,20 @@ class VKRestClient:
             logger.debug("VK typing indicator failed for peer_id=%s: %s", peer_id, exc)
 
     async def download_bytes(self, url: str, *, max_bytes: int = 80 * 1024 * 1024) -> bytes:
+        """Stream an attachment, stopping the moment it exceeds ``max_bytes``.
+
+        The cap is enforced *during* the stream, so a caller passing its
+        remaining budget can never be overshot by a large body.
+
+        Attachment URLs come out of the VK event payload, so the same
+        SSRF protections Hermes applies to its own media downloads are applied
+        here: the target is pre-flighted and every redirect hop is re-validated.
+        """
+        if max_bytes <= 0:
+            raise ValueError("VK attachment download budget is exhausted")
+        _reject_unsafe_url(url)
         async with self.http.stream("GET", url, follow_redirects=True) as response:
+            _reject_unsafe_url(str(response.url))
             response.raise_for_status()
             chunks: list[bytes] = []
             total = 0

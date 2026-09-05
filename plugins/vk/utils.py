@@ -78,11 +78,6 @@ def _largest_photo_url(photo: dict[str, Any]) -> str | None:
     return max(candidates, key=lambda item: item[0])[1]
 
 
-# Outbound idempotency: how many recent (peer, chunk, content) keys to remember
-# and for how long a retry should resolve to the same VK random_id.
-OUTBOUND_IDEMPOTENCY_MAX_ENTRIES = 512
-OUTBOUND_IDEMPOTENCY_TTL_SECONDS = 120.0
-
 # Recently handled Long Poll events, so an in-process redelivery (a `failed`
 # recovery that rewinds ts, an overlapping poll after reconnect) is suppressed.
 SEEN_EVENT_MAX_ENTRIES = 2048

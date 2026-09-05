@@ -74,7 +74,7 @@ def make_adapter(client=None, **overrides):
     adapter._outbound_random_ids = BoundedTTLCache(max_entries=32, ttl_seconds=120)
     adapter._interactive = InteractiveStore()
     adapter._last_actor = BoundedTTLCache(max_entries=32, ttl_seconds=3600)
-    adapter._last_inbound_cmid = BoundedTTLCache(max_entries=32, ttl_seconds=3600)
+    adapter._cmid_by_anchor = BoundedTTLCache(max_entries=32, ttl_seconds=3600)
     adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     for key, value in overrides.items():
@@ -255,9 +255,9 @@ async def test_configured_reactions_use_the_conversation_message_id():
 @pytest.mark.asyncio
 async def test_done_reaction_replaces_the_processing_one():
     adapter = make_adapter(reactions=ReactionConfig(processing=1, done=16))
-    adapter._last_inbound_cmid.set(GROUP_PEER, 42)
+    adapter._cmid_by_anchor.set((GROUP_PEER, "7"), 42)
 
-    await VKAdapter._react_done(adapter, GROUP_PEER)
+    await VKAdapter._react_done(adapter, GROUP_PEER, "7")
 
     assert adapter.client.reactions[-1] == {
         "peer_id": GROUP_PEER,
@@ -269,9 +269,9 @@ async def test_done_reaction_replaces_the_processing_one():
 @pytest.mark.asyncio
 async def test_done_removes_the_reaction_when_no_done_id_is_configured():
     adapter = make_adapter(reactions=ReactionConfig(processing=1))
-    adapter._last_inbound_cmid.set(GROUP_PEER, 42)
+    adapter._cmid_by_anchor.set((GROUP_PEER, "7"), 42)
 
-    await VKAdapter._react_done(adapter, GROUP_PEER)
+    await VKAdapter._react_done(adapter, GROUP_PEER, "7")
 
     assert adapter.client.reaction_deletes == [{"peer_id": GROUP_PEER, "cmid": 42}]
 
@@ -355,9 +355,9 @@ async def test_read_receipts_can_be_turned_off():
 @pytest.mark.asyncio
 async def test_a_successful_reply_closes_the_lifecycle_reaction():
     adapter = make_adapter(reactions=ReactionConfig(processing=1, done=16))
-    adapter._last_inbound_cmid.set(PEER, 3)
+    adapter._cmid_by_anchor.set((PEER, "7"), 3)
 
-    result = await VKAdapter.send(adapter, str(PEER), "the answer")
+    result = await VKAdapter.send(adapter, str(PEER), "the answer", reply_to="7")
 
     assert result.success
     assert adapter.client.reactions[-1]["reaction_id"] == 16
@@ -366,9 +366,9 @@ async def test_a_successful_reply_closes_the_lifecycle_reaction():
 @pytest.mark.asyncio
 async def test_replies_send_no_reactions_when_unconfigured():
     adapter = make_adapter()
-    adapter._last_inbound_cmid.set(PEER, 3)
+    adapter._cmid_by_anchor.set((PEER, "7"), 3)
 
-    await VKAdapter.send(adapter, str(PEER), "the answer")
+    await VKAdapter.send(adapter, str(PEER), "the answer", reply_to="7")
 
     assert adapter.client.reactions == []
     assert adapter.client.reaction_deletes == []

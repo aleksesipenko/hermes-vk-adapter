@@ -77,7 +77,7 @@ def make_adapter(client=None, **overrides):
     adapter._approval_counter = 0
     adapter._interactive = InteractiveStore()
     adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
-    adapter._last_inbound_cmid = BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._cmid_by_anchor = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     from plugins.vk.keyboards import VKKeyboardFactory
@@ -199,7 +199,7 @@ async def test_every_interactive_surface_degrades_without_callback_support():
         session_key=f"agent:main:vk:dm:{DM_PEER}",
         confirm_id="c1",
     )
-    await VKAdapter.send_model_picker(
+    picker = await VKAdapter.send_model_picker(
         adapter,
         chat_id=str(DM_PEER),
         providers=[{"slug": "p", "name": "P", "models": ["m"]}],
@@ -209,9 +209,11 @@ async def test_every_interactive_surface_degrades_without_callback_support():
         on_model_selected=None,
     )
 
-    assert [call.get("keyboard") for call in adapter.client.sends] == [None, None, None]
+    # Approval and slash-confirm degrade in place; the picker yields to core.
+    assert [call.get("keyboard") for call in adapter.client.sends] == [None, None]
     for call in adapter.client.sends:
-        assert "/approve" in call["message"] or "/model" in call["message"]
+        assert "/approve" in call["message"]
+    assert not picker.success
 
 
 @pytest.mark.asyncio
@@ -464,13 +466,13 @@ def test_attachment_and_text_budgets_are_totals_across_the_whole_walk():
 async def test_inbound_attachment_processing_is_capped(monkeypatch):
     downloads = []
 
-    async def fake_cache(url, ext=".jpg"):
-        downloads.append(url)
-        return "/tmp/x.jpg"
+    class CountingClient(RecordingClient):
+        async def download_bytes(self, url, *, max_bytes=None):
+            downloads.append(url)
+            return b"x"
 
-    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", fake_cache)
-    monkeypatch.setattr("plugins.vk.adapter._file_size", lambda path: 1)
-    adapter = make_adapter()
+    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_bytes", lambda data, ext: "/tmp/x.jpg")
+    adapter = make_adapter(CountingClient())
 
     attachments = [
         {"type": "photo", "photo": {"sizes": [{"width": 1, "height": 1, "url": f"u{i}"}]}}
@@ -605,9 +607,9 @@ async def test_a_failed_send_raises_the_configured_failure_reaction():
         RecordingClient(fail_send=httpx.ConnectError("down")),
         reactions=ReactionConfig(failed=5),
     )
-    adapter._last_inbound_cmid.set(DM_PEER, 3)
+    adapter._cmid_by_anchor.set((DM_PEER, "7"), 3)
 
-    result = await VKAdapter.send(adapter, str(DM_PEER), "text")
+    result = await VKAdapter.send(adapter, str(DM_PEER), "text", reply_to="7")
 
     assert not result.success
     assert adapter.client.reactions == [{"peer_id": DM_PEER, "cmid": 3, "reaction_id": 5}]
@@ -626,3 +628,319 @@ def test_inbound_side_effects_require_explicit_authorization(allow_all, allowlis
     adapter = make_adapter(allow_all_users=allow_all, allowed_users=allowlist)
 
     assert VKAdapter._is_allowed_vk_user(adapter, 101) is expected
+
+
+# ══ second review pass ════════════════════════════════════════════════════
+
+
+# ── Finding 1b: the total download budget must be hard ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_total_download_budget_is_enforced_during_the_stream(monkeypatch):
+    """Measuring after the fact let a big body overshoot the remaining cap."""
+    from plugins.vk.utils import MAX_INBOUND_DOWNLOAD_BYTES
+
+    fetched = []
+    cached = []
+
+    class BudgetedClient(RecordingClient):
+        async def download_bytes(self, url, *, max_bytes=None):
+            assert max_bytes is not None and max_bytes > 0
+            # A hostile server would return more than asked; the real client
+            # aborts mid-stream, so the most a caller can ever receive is the
+            # budget it passed.
+            served = min(20 * 1024 * 1024, max_bytes)
+            fetched.append(served)
+            return b"\xff\xd8\xff" + b"0" * (served - 3)
+
+    monkeypatch.setattr(
+        "plugins.vk.adapter.cache_image_from_bytes",
+        lambda data, ext: cached.append(len(data)) or "/tmp/x.jpg",
+    )
+    adapter = make_adapter(BudgetedClient())
+
+    attachments = [
+        {"type": "photo", "photo": {"sizes": [{"width": 1, "height": 1, "url": f"u{i}"}]}}
+        for i in range(8)
+    ]
+    _paths, _types, _kind, notes = await VKAdapter._extract_media(
+        adapter, {"attachments": attachments}
+    )
+
+    assert sum(fetched) <= MAX_INBOUND_DOWNLOAD_BYTES
+    assert sum(cached) <= MAX_INBOUND_DOWNLOAD_BYTES
+    assert any("budget exhausted" in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_audio_downloads_are_budgeted_too(monkeypatch):
+    seen = []
+
+    class BudgetedClient(RecordingClient):
+        async def download_bytes(self, url, *, max_bytes=None):
+            seen.append(max_bytes)
+            return b"OggS"
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_audio_from_bytes", lambda data, ext: "/tmp/a.ogg")
+    adapter = make_adapter(BudgetedClient())
+
+    await VKAdapter._extract_media(
+        adapter,
+        {"attachments": [{"type": "audio_message", "audio_message": {"link_ogg": "https://vk/x"}}]},
+    )
+
+    assert seen and all(value and value > 0 for value in seen)
+
+
+@pytest.mark.asyncio
+async def test_a_download_budget_of_zero_is_refused_by_the_client():
+    from plugins.vk.client import VKRestClient
+
+    client = VKRestClient("t" * 85, 1, "5.199")
+    try:
+        with pytest.raises(ValueError, match="budget is exhausted"):
+            await client.download_bytes("https://vk.example/x", max_bytes=0)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_attachment_urls_are_checked_before_download():
+    """VK-supplied URLs are still untrusted input."""
+    from plugins.vk.client import VKRestClient
+
+    client = VKRestClient("t" * 85, 1, "5.199")
+    try:
+        with pytest.raises(ValueError, match="http"):
+            await client.download_bytes("file:///etc/passwd")
+    finally:
+        await client.close()
+
+
+# ── Finding 2: max_text_chars is an exact total ──────────────────────────
+
+
+@pytest.mark.parametrize("limit", [20, 60, 120, 400])
+def test_rendered_context_never_exceeds_max_text_chars(limit):
+    """Labels and the truncation marker are output too, so they count."""
+    limits = ContextLimits(
+        max_depth=3, max_messages=10, max_text_chars=limit, max_attachments=5
+    )
+    forwards = [
+        {
+            "from_id": index,
+            "text": "some forwarded body text that is not short",
+            "attachments": [{"type": "doc", "doc": {"title": f"d{n}.pdf"}} for n in range(4)],
+        }
+        for index in range(5)
+    ]
+
+    context = summarize_message_context({"fwd_messages": forwards}, limits)
+
+    assert len(context) <= limit
+
+
+def test_truncation_stays_truthful_even_at_a_tiny_budget():
+    limits = ContextLimits(max_depth=2, max_messages=5, max_text_chars=25, max_attachments=2)
+
+    context = summarize_message_context(
+        {"fwd_messages": [{"from_id": 1, "text": "x" * 500}]}, limits
+    )
+
+    assert len(context) <= 25
+    assert "truncated" in context.lower()
+
+
+# ── Finding 3: reactions must target the message they answer ─────────────
+
+
+@pytest.mark.asyncio
+async def test_a_second_speaker_does_not_steal_the_first_users_reaction():
+    """A's reply must react to A's message even after B's arrived."""
+    adapter = make_adapter(reactions=ReactionConfig(done=16))
+    adapter._cmid_by_anchor.set((GROUP_PEER, "a-anchor"), 11)
+    adapter._cmid_by_anchor.set((GROUP_PEER, "b-anchor"), 22)
+
+    await VKAdapter.send(adapter, str(GROUP_PEER), "answer to A", reply_to="a-anchor")
+
+    assert adapter.client.reactions == [
+        {"peer_id": GROUP_PEER, "cmid": 11, "reaction_id": 16}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_proactive_send_reacts_to_nothing():
+    """Cron delivery answers no message, so there is no target to react to."""
+    adapter = make_adapter(reactions=ReactionConfig(done=16))
+    adapter._cmid_by_anchor.set((GROUP_PEER, "stale"), 11)
+
+    await VKAdapter.send(adapter, str(GROUP_PEER), "scheduled report")
+
+    assert adapter.client.reactions == []
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_anchor_reacts_to_nothing():
+    adapter = make_adapter(reactions=ReactionConfig(done=16))
+
+    await VKAdapter.send(adapter, str(GROUP_PEER), "answer", reply_to="never-seen")
+
+    assert adapter.client.reactions == []
+
+
+@pytest.mark.asyncio
+async def test_media_delivery_uses_the_same_reaction_rule(tmp_path):
+    adapter = make_adapter(reactions=ReactionConfig(done=16))
+    adapter._cmid_by_anchor.set((GROUP_PEER, "a-anchor"), 11)
+
+    class DocClient(RecordingClient):
+        async def upload_document_raw(self, *, peer_id, path, title=None):
+            return "doc-1_1"
+
+    adapter.client = DocClient()
+    adapter._cmid_by_anchor.set((GROUP_PEER, "a-anchor"), 11)
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"pdf")
+
+    await VKAdapter.send_media_files(
+        adapter, str(GROUP_PEER), [str(doc)], "caption", reply_to="a-anchor"
+    )
+
+    assert adapter.client.reactions == [
+        {"peer_id": GROUP_PEER, "cmid": 11, "reaction_id": 16}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_inbound_handler_records_the_anchor_it_puts_on_the_event():
+    adapter = make_adapter()
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    async def no_media(_message):
+        from gateway.platforms.base import MessageType
+
+        return [], [], MessageType.TEXT, []
+
+    adapter.handle_message = fake_handle_message
+    adapter._extract_media = no_media
+    adapter.build_source = lambda **kw: None
+
+    await VKAdapter._handle_message_new(
+        adapter,
+        {"peer_id": GROUP_PEER, "from_id": USER_A, "text": "hi", "conversation_message_id": 77},
+        {"type": "message_new"},
+    )
+
+    anchor = captured[0].message_id
+    assert VKAdapter._trigger_cmid(adapter, GROUP_PEER, anchor) == 77
+
+
+# ── Finding 4: local doctor rejects an invalid configured home peer ──────
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "0", "2000000001.5", "club2000000001"])
+def test_a_configured_but_unusable_home_peer_fails_locally(value):
+    """A whitespace-only value strips to empty and is treated as absent."""
+    from plugins.vk.doctor import run_local_checks
+
+    env = {
+        "VK_GROUP_TOKEN": "a" * 85,
+        "VK_GROUP_ID": "123456789",
+        "VK_HOME_PEER_ID": value,
+    }
+    statuses = {r.name: r.status for r in run_local_checks(env)}
+
+    assert statuses["home_peer_id"] == "fail"
+
+
+def test_an_absent_home_peer_is_still_only_skipped():
+    from plugins.vk.doctor import run_local_checks
+
+    env = {"VK_GROUP_TOKEN": "a" * 85, "VK_GROUP_ID": "123456789"}
+    statuses = {r.name: r.status for r in run_local_checks(env)}
+
+    assert statuses["home_peer_id"] == "skip"
+
+
+def test_a_valid_home_peer_passes_locally():
+    from plugins.vk.doctor import run_local_checks
+
+    env = {
+        "VK_GROUP_TOKEN": "a" * 85,
+        "VK_GROUP_ID": "123456789",
+        "VK_HOME_PEER_ID": "2000000001",
+    }
+    statuses = {r.name: r.status for r in run_local_checks(env)}
+
+    assert statuses["home_peer_id"] == "ok"
+
+
+# ── Finding 5: the picker yields to core's usable fallback ───────────────
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_client_gets_no_adapter_owned_picker():
+    """Core only returns early on success, so non-success runs its own list."""
+    adapter = make_adapter()  # no capabilities recorded
+
+    result = await VKAdapter.send_model_picker(
+        adapter,
+        chat_id=str(DM_PEER),
+        providers=[{"slug": "p", "name": "P", "models": ["vendor/model-a"]}],
+        current_model="vendor/model-a",
+        current_provider="p",
+        session_key=f"agent:main:vk:dm:{DM_PEER}",
+        on_model_selected=None,
+    )
+
+    assert not result.success
+    assert adapter.client.sends == [], "an unusable picker was sent anyway"
+
+
+def test_core_falls_back_when_the_picker_reports_non_success():
+    """Contract: gateway/slash_commands.py returns early only on success."""
+    import inspect
+
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    source = inspect.getsource(GatewaySlashCommandsMixin._handle_model_command)
+    assert "send_model_picker" in source
+    assert "if result.success:" in source
+    assert "return None" in source
+
+
+@pytest.mark.asyncio
+async def test_a_capable_client_still_gets_the_button_picker():
+    adapter = make_adapter()
+    VKAdapter._remember_capabilities(adapter, DM_PEER, MODERN)
+
+    result = await VKAdapter.send_model_picker(
+        adapter,
+        chat_id=str(DM_PEER),
+        providers=[{"slug": "p", "name": "P", "models": ["vendor/model-a"]}],
+        current_model="vendor/model-a",
+        current_provider="p",
+        session_key=f"agent:main:vk:dm:{DM_PEER}",
+        on_model_selected=None,
+    )
+
+    assert result.success
+    assert adapter.client.sends[0]["keyboard"]
+
+
+# ── cleanup: the dead idempotency cache is gone ─────────────────────────
+
+
+def test_the_dead_outbound_idempotency_cache_is_removed():
+    import inspect
+
+    from plugins.vk import adapter as adapter_module
+    from plugins.vk import utils as utils_module
+
+    blob = inspect.getsource(adapter_module) + inspect.getsource(utils_module)
+    assert "_outbound_random_ids" not in blob
+    assert "OUTBOUND_IDEMPOTENCY" not in blob

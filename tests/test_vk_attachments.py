@@ -128,15 +128,18 @@ def test_total_context_text_is_capped():
 
 
 def test_the_attachment_count_is_capped_and_the_excess_is_reported():
+    """Roomy character budget so the cap, not the text budget, is what bites."""
+    limits = ContextLimits(max_depth=2, max_messages=3, max_text_chars=400, max_attachments=3)
     attachments = [{"type": "photo", "photo": {}} for _ in range(20)]
 
     context = summarize_message_context(
         {"reply_message": {"from_id": 1, "text": "look", "attachments": attachments}},
-        TIGHT,
+        limits,
     )
 
-    assert context.count("[photo]") <= TIGHT.max_attachments
+    assert context.count("[photo]") <= limits.max_attachments
     assert "more attachment" in context.lower()
+    assert len(context) <= limits.max_text_chars
 
 
 def test_a_forward_with_only_attachments_is_still_represented():
