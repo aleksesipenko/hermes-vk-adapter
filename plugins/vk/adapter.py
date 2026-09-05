@@ -101,6 +101,8 @@ class VKAdapter(BasePlatformAdapter):
     #: raising from a decorative code path.
     reactions = ReactionConfig()
     _cmid_by_anchor = None
+    _pending_done = None
+    _reacted_triggers = None
 
     #: Bounded backoff between failed Long Poll attempts.
     POLL_BACKOFF_BASE = 1.0
@@ -151,6 +153,17 @@ class VKAdapter(BasePlatformAdapter):
         # anchor back to send() as reply_to, so a reaction can be tied to the
         # exact message it answers instead of to "whoever spoke here last".
         self._cmid_by_anchor = BoundedTTLCache(
+            max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
+        )
+        # An editable streaming preview is not the answer yet, so the trigger it
+        # will eventually resolve is parked against the draft message id until
+        # edit_message(finalize=True) arrives.
+        self._pending_done = BoundedTTLCache(
+            max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
+        )
+        # Terminal reactions fire once per trigger, whichever delivery path
+        # (text, photo, document, edit) happens to get there first.
+        self._reacted_triggers = BoundedTTLCache(
             max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
         )
         # What each peer's client can render, and who the peers actually are.
@@ -336,7 +349,14 @@ class VKAdapter(BasePlatformAdapter):
                         random_id=random_id,
                     )
                 sent_ids.append(str(response))
-            await self._react_done(peer_id, reply_to)
+            if (metadata or {}).get("expect_edits"):
+                # The gateway will keep editing this draft; the turn is not
+                # over, so park the trigger and let finalize close it out.
+                self._park_pending_done(
+                    peer_id, sent_ids, self._trigger_cmid(peer_id, reply_to)
+                )
+            else:
+                await self._react_done(peer_id, reply_to)
             return SendResult(
                 success=True,
                 message_id=sent_ids[-1] if sent_ids else None,
@@ -416,6 +436,7 @@ class VKAdapter(BasePlatformAdapter):
                     message=caption or "",
                     attachment=ref,
                 )
+            await self._react_done(peer_id, reply_to)
             return SendResult(success=True, message_id=str(response))
         except (VKApiError, RuntimeError, OSError, ValueError, httpx.HTTPError) as exc:
             logger.warning(
@@ -423,6 +444,9 @@ class VKAdapter(BasePlatformAdapter):
                 peer_id,
                 exc,
             )
+            # No reaction here: the document fallback below is still a delivery
+            # attempt, and _claim_terminal_reaction keeps whichever succeeds
+            # from reacting twice.
             return await self.send_document(
                 chat_id=chat_id,
                 file_path=image_path,
@@ -577,6 +601,11 @@ class VKAdapter(BasePlatformAdapter):
         if not chunks:
             chunks = [""]
 
+        # The trigger this draft answers, parked when the preview was sent.
+        pending_cmid = 0
+        if self._pending_done is not None:
+            pending_cmid = _safe_int(self._pending_done.get((peer_id, str(target_id))), 0)
+
         try:
             if not finalize and len(chunks) > 1:
                 # Streaming preview. The stream consumer calls this repeatedly
@@ -590,6 +619,7 @@ class VKAdapter(BasePlatformAdapter):
                     message_id=target_id,
                     message=self._streaming_preview(chunks[0]),
                 )
+                # Deliberately no reaction: the turn is still in progress.
                 return SendResult(success=True, message_id=str(target_id))
 
             await self.client.edit_message(
@@ -605,7 +635,16 @@ class VKAdapter(BasePlatformAdapter):
                 sent_ids.append(str(response))
         except Exception as exc:
             logger.warning("VK edit failed peer_id=%s: %s", peer_id, redact_secrets(exc))
+            if finalize:
+                # A failed final edit is the end of the turn: the user is not
+                # getting the answer, so say so.
+                await self._react_failed(peer_id, cmid=pending_cmid)
             return self._failed_send(exc)
+
+        if finalize:
+            # The streamed answer is complete; this is where "done" is true.
+            self._park_pending_done(peer_id, sent_ids, pending_cmid)
+            await self._react_done(peer_id, cmid=pending_cmid)
 
         return SendResult(
             success=True,
@@ -664,22 +703,48 @@ class VKAdapter(BasePlatformAdapter):
             return 0
         return _safe_int(self._cmid_by_anchor.get((peer_id, str(reply_to))), 0)
 
-    async def _react_failed(self, peer_id: int, reply_to: Any = None) -> None:
+    def _claim_terminal_reaction(self, peer_id: int, cmid: int) -> bool:
+        """Allow exactly one terminal reaction per triggering message.
+
+        send_image_file delegates its fallback to the document path, and both
+        would otherwise react; the turn only ends once.
+        """
+        if self._reacted_triggers is None:
+            return True
+        key = (peer_id, cmid)
+        if key in self._reacted_triggers:
+            return False
+        self._reacted_triggers.set(key, True)
+        return True
+
+    def _park_pending_done(self, peer_id: int, message_ids: list[str], cmid: int) -> None:
+        """Remember which trigger an editable draft will eventually answer."""
+        if self._pending_done is None or not cmid:
+            return
+        for message_id in message_ids:
+            if message_id:
+                self._pending_done.set((peer_id, str(message_id)), cmid)
+
+    async def _react_failed(self, peer_id: int, reply_to: Any = None, *, cmid: int = 0) -> None:
         """Mark the triggering message when *our own* delivery failed.
 
         This is the only failure the adapter can honestly observe: Hermes
         exposes no agent-run-failed hook to a platform adapter.
         """
         reaction_id = self.reactions.failed
-        cmid = self._trigger_cmid(peer_id, reply_to)
+        cmid = cmid or self._trigger_cmid(peer_id, reply_to)
         if not reaction_id or not self.client or not cmid:
+            return
+        if not self._claim_terminal_reaction(peer_id, cmid):
             return
         await self._react(peer_id, cmid, reaction_id)
 
-    async def _react_done(self, peer_id: int, reply_to: Any = None) -> None:
+    async def _react_done(self, peer_id: int, reply_to: Any = None, *, cmid: int = 0) -> None:
         """Close out the lifecycle reaction on the message we replied to."""
-        cmid = self._trigger_cmid(peer_id, reply_to)
+        cmid = cmid or self._trigger_cmid(peer_id, reply_to)
         if not self.reactions.enabled or not self.client or not cmid:
+            return
+        if not self._claim_terminal_reaction(peer_id, cmid):
             return
         if self.reactions.done:
             await self._react(peer_id, cmid, self.reactions.done)
@@ -821,8 +886,10 @@ class VKAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.exception("VK attachment send failed peer_id=%s", peer_id)
+            await self._react_failed(peer_id, reply_to)
             return self._failed_send(exc)
 
+        await self._react_done(peer_id, reply_to)
         return SendResult(
             success=True,
             message_id=sent_ids[-1] if sent_ids else None,

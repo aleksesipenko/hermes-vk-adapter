@@ -76,8 +76,9 @@ def make_adapter(client=None, **overrides):
     adapter.reactions = ReactionConfig()
     adapter._approval_counter = 0
     adapter._interactive = InteractiveStore()
-    adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
     adapter._cmid_by_anchor = BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._pending_done = BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._reacted_triggers = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     from plugins.vk.keyboards import VKKeyboardFactory
@@ -944,3 +945,320 @@ def test_the_dead_outbound_idempotency_cache_is_removed():
     blob = inspect.getsource(adapter_module) + inspect.getsource(utils_module)
     assert "_outbound_random_ids" not in blob
     assert "OUTBOUND_IDEMPOTENCY" not in blob
+
+
+# ══ third review pass ═════════════════════════════════════════════════════
+
+
+# ── Redirects must be validated before they are followed ────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_public_redirect_to_a_private_target_is_never_requested():
+    """httpx follow_redirects=True issues every hop before returning.
+
+    Checking the final response.url therefore runs *after* the request to the
+    internal address already happened. The private target must see zero
+    requests. Runs against the real tools.url_safety when Hermes is present --
+    nothing here stubs it into allowing private addresses.
+    """
+    import respx
+    from httpx import Response
+
+    from plugins.vk.client import VKRestClient
+
+    private_hits = []
+
+    client = VKRestClient("t" * 85, 1, "5.199")
+    with respx.mock:
+        respx.get("https://cdn.vk.example/photo.jpg").mock(
+            return_value=Response(302, headers={"location": "http://127.0.0.1/latest/meta-data"})
+        )
+
+        def record_private(request):
+            private_hits.append(str(request.url))
+            return Response(200, content=b"SECRET")
+
+        respx.get("http://127.0.0.1/latest/meta-data").mock(side_effect=record_private)
+
+        try:
+            with pytest.raises(ValueError):
+                await client.download_bytes("https://cdn.vk.example/photo.jpg")
+        finally:
+            await client.close()
+
+    assert private_hits == [], "the internal address was requested anyway"
+
+
+@pytest.mark.asyncio
+async def test_the_real_url_safety_check_is_actually_in_play():
+    """Guard the guard: if Hermes is importable, private URLs must be refused."""
+    from plugins.vk.client import _reject_unsafe_url
+
+    pytest.importorskip("tools.url_safety")
+
+    for blocked in ("http://127.0.0.1/x", "http://169.254.169.254/latest", "http://10.0.0.1/x"):
+        with pytest.raises(ValueError):
+            _reject_unsafe_url(blocked)
+
+
+@pytest.mark.asyncio
+async def test_a_link_local_redirect_target_is_never_requested():
+    import respx
+    from httpx import Response
+
+    from plugins.vk.client import VKRestClient
+
+    hits = []
+    client = VKRestClient("t" * 85, 1, "5.199")
+    with respx.mock:
+        respx.get("https://cdn.vk.example/a.jpg").mock(
+            return_value=Response(301, headers={"location": "http://169.254.169.254/latest/"})
+        )
+        respx.get("http://169.254.169.254/latest/").mock(
+            side_effect=lambda request: hits.append(1) or Response(200, content=b"x")
+        )
+        try:
+            with pytest.raises(ValueError):
+                await client.download_bytes("https://cdn.vk.example/a.jpg")
+        finally:
+            await client.close()
+
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_without_a_location_is_rejected():
+    import respx
+    from httpx import Response
+
+    from plugins.vk.client import VKRestClient
+
+    client = VKRestClient("t" * 85, 1, "5.199")
+    with respx.mock:
+        respx.get("https://cdn.vk.example/b.jpg").mock(return_value=Response(302))
+        try:
+            with pytest.raises(ValueError, match="Location"):
+                await client.download_bytes("https://cdn.vk.example/b.jpg")
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_chain_is_bounded():
+    import respx
+    from httpx import Response
+
+    from plugins.vk.client import MAX_DOWNLOAD_REDIRECTS, VKRestClient
+
+    requests = []
+    client = VKRestClient("t" * 85, 1, "5.199")
+    with respx.mock:
+
+        def loop(request):
+            requests.append(str(request.url))
+            return Response(302, headers={"location": "https://cdn.vk.example/loop"})
+
+        respx.get("https://cdn.vk.example/loop").mock(side_effect=loop)
+        try:
+            with pytest.raises(ValueError, match="redirects"):
+                await client.download_bytes("https://cdn.vk.example/loop")
+        finally:
+            await client.close()
+
+    assert len(requests) <= MAX_DOWNLOAD_REDIRECTS + 1
+
+
+@pytest.mark.asyncio
+async def test_a_public_redirect_is_followed_and_still_size_capped():
+    import respx
+    from httpx import Response
+
+    from plugins.vk.client import VKRestClient
+
+    client = VKRestClient("t" * 85, 1, "5.199")
+    with respx.mock:
+        respx.get("https://cdn.vk.example/c.jpg").mock(
+            return_value=Response(302, headers={"location": "https://cdn2.vk.example/c.jpg"})
+        )
+        respx.get("https://cdn2.vk.example/c.jpg").mock(
+            return_value=Response(200, content=b"0" * 5000)
+        )
+        try:
+            assert len(await client.download_bytes("https://cdn.vk.example/c.jpg")) == 5000
+            with pytest.raises(ValueError, match="max_bytes"):
+                await client.download_bytes("https://cdn.vk.example/c.jpg", max_bytes=100)
+        finally:
+            await client.close()
+
+
+# ── Streaming lifecycle reactions ───────────────────────────────────────
+
+
+def streaming_adapter():
+    adapter = make_adapter(reactions=ReactionConfig(done=16, failed=5))
+    adapter._cmid_by_anchor.set((DM_PEER, "anchor"), 11)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_a_streaming_preview_does_not_claim_the_turn_is_done():
+    """GatewayStreamConsumer sends the first draft with expect_edits=True."""
+    adapter = streaming_adapter()
+
+    result = await VKAdapter.send(
+        adapter, str(DM_PEER), "partial", reply_to="anchor", metadata={"expect_edits": True}
+    )
+
+    assert result.success
+    assert adapter.client.reactions == []
+
+
+@pytest.mark.asyncio
+async def test_non_final_edits_do_not_mark_done_and_the_final_one_does():
+    adapter = streaming_adapter()
+
+    preview = await VKAdapter.send(
+        adapter, str(DM_PEER), "partial", reply_to="anchor", metadata={"expect_edits": True}
+    )
+    draft_id = preview.message_id
+
+    for partial in ("longer partial", "much longer partial"):
+        await VKAdapter.edit_message(adapter, str(DM_PEER), draft_id, partial, finalize=False)
+    assert adapter.client.reactions == [], "a non-final edit marked the turn done"
+
+    await VKAdapter.edit_message(adapter, str(DM_PEER), draft_id, "final answer", finalize=True)
+
+    assert adapter.client.reactions == [{"peer_id": DM_PEER, "cmid": 11, "reaction_id": 16}]
+
+
+@pytest.mark.asyncio
+async def test_the_done_reaction_fires_exactly_once_across_repeated_finalizes():
+    adapter = streaming_adapter()
+    preview = await VKAdapter.send(
+        adapter, str(DM_PEER), "partial", reply_to="anchor", metadata={"expect_edits": True}
+    )
+
+    for _ in range(3):
+        await VKAdapter.edit_message(
+            adapter, str(DM_PEER), preview.message_id, "final", finalize=True
+        )
+
+    assert len(adapter.client.reactions) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_final_edit_marks_the_original_trigger_failed():
+    adapter = streaming_adapter()
+    preview = await VKAdapter.send(
+        adapter, str(DM_PEER), "partial", reply_to="anchor", metadata={"expect_edits": True}
+    )
+
+    class BrokenEdit(type(adapter.client)):
+        async def edit_message(self, **kwargs):
+            raise httpx.ConnectError("down")
+
+    broken = BrokenEdit()
+    broken.reactions = adapter.client.reactions
+    adapter.client = broken
+
+    result = await VKAdapter.edit_message(
+        adapter, str(DM_PEER), preview.message_id, "final", finalize=True
+    )
+
+    assert not result.success
+    assert adapter.client.reactions[-1] == {"peer_id": DM_PEER, "cmid": 11, "reaction_id": 5}
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_send_still_marks_done_immediately():
+    adapter = streaming_adapter()
+
+    await VKAdapter.send(adapter, str(DM_PEER), "answer", reply_to="anchor")
+
+    assert adapter.client.reactions == [{"peer_id": DM_PEER, "cmid": 11, "reaction_id": 16}]
+
+
+@pytest.mark.asyncio
+async def test_a_successful_single_image_send_marks_done(tmp_path):
+    adapter = streaming_adapter()
+
+    class PhotoClient(type(adapter.client)):
+        async def upload_photo_message_raw(self, *, peer_id, path):
+            return "photo-1_1"
+
+    photo = PhotoClient()
+    photo.reactions = adapter.client.reactions
+    adapter.client = photo
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+
+    result = await VKAdapter.send_image_file(
+        adapter, str(DM_PEER), str(image), caption="c", reply_to="anchor"
+    )
+
+    assert result.success
+    assert adapter.client.reactions == [{"peer_id": DM_PEER, "cmid": 11, "reaction_id": 16}]
+
+
+@pytest.mark.asyncio
+async def test_the_photo_document_fallback_does_not_react_twice(tmp_path):
+    """The fallback delegates to the media path; only one reaction may fire."""
+    adapter = streaming_adapter()
+
+    class FallbackClient(type(adapter.client)):
+        async def upload_photo_message_raw(self, *, peer_id, path):
+            raise RuntimeError("photos scope missing")
+
+        async def upload_document_raw(self, *, peer_id, path, title=None):
+            return "doc-1_1"
+
+    fallback = FallbackClient()
+    fallback.reactions = adapter.client.reactions
+    adapter.client = fallback
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+
+    result = await VKAdapter.send_image_file(
+        adapter, str(DM_PEER), str(image), caption="c", reply_to="anchor"
+    )
+
+    assert result.success
+    assert len(adapter.client.reactions) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_image_send_marks_failed_once(tmp_path):
+    adapter = streaming_adapter()
+
+    class DeadClient(type(adapter.client)):
+        async def upload_photo_message_raw(self, *, peer_id, path):
+            raise RuntimeError("photos scope missing")
+
+        async def upload_document_raw(self, *, peer_id, path, title=None):
+            raise httpx.ConnectError("down")
+
+    dead = DeadClient()
+    dead.reactions = adapter.client.reactions
+    adapter.client = dead
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+
+    result = await VKAdapter.send_image_file(adapter, str(DM_PEER), str(image), reply_to="anchor")
+
+    assert not result.success
+    assert adapter.client.reactions == [{"peer_id": DM_PEER, "cmid": 11, "reaction_id": 5}]
+
+
+@pytest.mark.asyncio
+async def test_a_streaming_preview_with_no_anchor_still_reacts_to_nothing():
+    adapter = streaming_adapter()
+
+    preview = await VKAdapter.send(
+        adapter, str(DM_PEER), "partial", metadata={"expect_edits": True}
+    )
+    await VKAdapter.edit_message(
+        adapter, str(DM_PEER), preview.message_id, "final", finalize=True
+    )
+
+    assert adapter.client.reactions == []

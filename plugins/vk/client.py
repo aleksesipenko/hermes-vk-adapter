@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
@@ -53,6 +54,9 @@ VK_MESSAGE_PHOTO_MIME_TYPES = {
 # VK ``random_id`` is a signed 32-bit integer and must be non-zero for the
 # deduplication VK performs on messages.send.
 VK_RANDOM_ID_MAX = 2_147_483_647
+
+#: Redirect hops allowed when fetching an attachment.
+MAX_DOWNLOAD_REDIRECTS = 5
 
 # ── Error classification ──────────────────────────────────────────────────
 #
@@ -311,24 +315,43 @@ class VKRestClient:
         The cap is enforced *during* the stream, so a caller passing its
         remaining budget can never be overshot by a large body.
 
-        Attachment URLs come out of the VK event payload, so the same
-        SSRF protections Hermes applies to its own media downloads are applied
-        here: the target is pre-flighted and every redirect hop is re-validated.
+        Attachment URLs come out of the VK event payload, so redirects are
+        followed manually: httpx's ``follow_redirects=True`` issues every hop
+        before returning, which means a check on the *final* response URL runs
+        long after a request to ``127.0.0.1`` or a link-local metadata address
+        has already been made. Each hop is therefore validated **before** it is
+        requested, and the chain is bounded.
+
+        This is a URL-level check. It does not defend against DNS rebinding or
+        a hostname that resolves to a private address at connect time; that
+        would need an SSRF-safe transport, which this client does not install.
         """
         if max_bytes <= 0:
             raise ValueError("VK attachment download budget is exhausted")
-        _reject_unsafe_url(url)
-        async with self.http.stream("GET", url, follow_redirects=True) as response:
-            _reject_unsafe_url(str(response.url))
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"VK attachment exceeds max_bytes={max_bytes}")
-                chunks.append(chunk)
-            return b"".join(chunks)
+
+        target = url
+        for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            # Validate before the request, never after.
+            _reject_unsafe_url(target)
+            async with self.http.stream("GET", target, follow_redirects=False) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location", "").strip()
+                    if not location:
+                        raise ValueError("VK attachment redirect had no Location header")
+                    target = urljoin(str(response.url), location)
+                    continue
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"VK attachment exceeds max_bytes={max_bytes}")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        raise ValueError(
+            f"VK attachment exceeded {MAX_DOWNLOAD_REDIRECTS} redirects"
+        )
 
     async def upload_document_raw(
         self, *, peer_id: int, path: str, title: str | None = None
