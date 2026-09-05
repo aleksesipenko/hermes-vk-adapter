@@ -1,6 +1,6 @@
 [project]
 name = "hermes-vk-adapter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hermes Gateway platform adapter for VK community messages."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,7 +1,7 @@
 name: vk
 label: VK
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: Адаптер VK-сообщества через Long Poll для Hermes Agent.
 author: Alex / Hermes local plugin
 requires_env:

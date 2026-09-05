@@ -78,13 +78,24 @@ def test_root_and_nested_manifests_declare_the_same_environment():
     assert sorted(_env_names(root, "optional_env")) == sorted(_env_names(nested, "optional_env"))
 
 
-def test_manifest_version_matches_the_package_version():
+def test_both_manifests_and_the_package_declare_the_same_version():
+    """All three version declarations must be bumped together.
+
+    A release that touches only some of them ships a plugin whose advertised
+    version depends on which file the installer happened to read.  Versions are
+    compared as strings because YAML would silently read a two-part `0.2` as a
+    float.
+    """
     import tomllib
 
-    manifest = _load("plugin.yaml")
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    versions = {
+        "plugin.yaml": str(_load("plugin.yaml")["version"]),
+        "plugins/vk/plugin.yaml": str(_load("plugins/vk/plugin.yaml")["version"]),
+        "pyproject.toml": str(pyproject["project"]["version"]),
+    }
 
-    assert manifest["version"] == pyproject["project"]["version"]
+    assert len(set(versions.values())) == 1, f"version drift: {versions}"
 
 
 def test_every_documented_env_var_is_declared_in_the_manifest():
