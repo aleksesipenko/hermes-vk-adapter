@@ -78,3 +78,13 @@ optional_env:
     prompt: Отключить отметку о прочтении
     secret: false
     password: false
+  - name: VK_REACTION_FAILED_ID
+    description: 'Числовой id VK-реакции «ошибка». Необязательно; по умолчанию выключено.'
+    prompt: Числовой id реакции «ошибка»
+    secret: false
+    password: false
+  - name: VK_COMMAND_KEYBOARD_DISABLED
+    description: 'Устаревший синоним VK_COMMAND_KEYBOARD=false. Поставь true, чтобы скрыть клавиатуру команд.'
+    prompt: Скрыть клавиатуру команд
+    secret: false
+    password: false

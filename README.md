@@ -29,13 +29,35 @@ VK-аккаунта и без отдельного процесса-посред
 - личные сообщения VK-сообщества;
 - VK беседы с политикой mention/reply для обычного текста;
 - slash-команды Hermes, например `/status`, `/commands`, `/model`;
-- callback-кнопки для model picker, approvals и clarify;
+- callback-кнопки для model picker, approvals и clarify, привязанные к
+  конкретному пользователю и беседе, с TTL и защитой от повторов;
+- текстовый fallback для клиентов без поддержки callback-кнопок;
 - allowlist по numeric VK user id;
-- plain-text вывод без Telegram Markdown assumptions;
+- plain-text вывод без Telegram Markdown assumptions, с разбиением длинных
+  ответов без потери символов;
 - входящие фото, документы и voice/audio message как Hermes media;
-- нативная отправка JPG/JPEG, PNG и GIF как VK-фото;
+- reply/forward-контекст и метаданные неподдерживаемых вложений как текст;
+- нативная отправка JPG/JPEG, PNG и GIF как VK-фото, батчами;
 - отправка сгенерированных документов через VK docs upload;
-- `VK_HOME_PEER_ID` для cron/proactive delivery.
+- `messages.edit` и `messages.delete`, с продолжением при лимите 4096;
+- реальные имена пользователей и названия бесед с кэшем и TTL;
+- опциональные числовые VK-реакции и отметка о прочтении;
+- `VK_HOME_PEER_ID` для cron/proactive delivery;
+- `hermes vk-doctor` для локальной и read-only живой диагностики.
+
+Чего плагин не делает:
+
+- не восстанавливает пропущенные сообщения после долгого простоя gateway:
+  дедупликация Long Poll держится в памяти процесса, персистентного backlog
+  нет;
+- не рассчитан на публичный многопользовательский режим: держи
+  `VK_ALLOW_ALL_USERS=false` и заполняй `VK_ALLOWED_USERS`;
+- не использует Callback API/webhook, только Bots Long Poll;
+- не поддерживает personal/user-токены, VK Mini Apps, стену, рассылки и
+  carousel;
+- не отправляет голосовые сообщения нативно: аудио уходит документом.
+
+Проверено тестами на моках VK; живые VK-вызовы в CI не выполняются.
 
 ## Установка
 

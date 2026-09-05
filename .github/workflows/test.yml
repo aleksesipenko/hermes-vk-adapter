@@ -1,0 +1,84 @@
+name: test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # Hermes Agent is not on PyPI, so the adapter-contract tests carry the
+      # `hermes_contract` marker and skip here. Everything that does not import
+      # Hermes -- the VK client, chunking, keyboards, callbacks, bounded state,
+      # attachments, doctor -- runs in full.
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Guard against the suite silently emptying out
+        run: |
+          COLLECTED=$(python -m pytest -q --collect-only 2>/dev/null | tail -1)
+          echo "collected: $COLLECTED"
+          python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-m", "pytest", "-q", "--collect-only"],
+              capture_output=True, text=True,
+          ).stdout
+          count = sum(1 for line in out.splitlines() if "::" in line)
+          assert count >= 150, f"only {count} tests collected; the suite lost coverage"
+          print(f"{count} tests collected")
+          PY
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Dependency consistency
+        run: python -m pip check
+
+      - name: Packaging and import smoke
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel --outdir dist/
+          python - <<'PY'
+          import importlib
+          for name in (
+              "plugins.vk.client",
+              "plugins.vk.utils",
+              "plugins.vk.state",
+              "plugins.vk.formatting",
+              "plugins.vk.keyboards",
+              "plugins.vk.interactive",
+              "plugins.vk.capabilities",
+              "plugins.vk.attachments",
+              "plugins.vk.doctor",
+          ):
+              importlib.import_module(name)
+          print("plugin modules import without Hermes and without a VK SDK")
+          PY
+
+      - name: Manifest is valid YAML
+        run: |
+          python -m pip install pyyaml
+          python -c "import yaml; yaml.safe_load(open('plugin.yaml')); yaml.safe_load(open('plugins/vk/plugin.yaml')); print('manifests ok')"

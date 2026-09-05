@@ -44,3 +44,75 @@ def test_repo_root_register_shim_loads_vk_adapter() -> None:
 
     assert isinstance(module, ModuleType)
     assert callable(module.register)
+
+
+# ── manifest consistency (Task 11) ────────────────────────────────────────
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load(relative: str) -> dict:
+    import yaml
+
+    return yaml.safe_load((REPO_ROOT / relative).read_text(encoding="utf-8"))
+
+
+def _env_names(manifest: dict, key: str) -> list[str]:
+    return [entry["name"] for entry in (manifest.get(key) or [])]
+
+
+def test_root_and_nested_manifests_agree_on_identity():
+    root = _load("plugin.yaml")
+    nested = _load("plugins/vk/plugin.yaml")
+
+    for field in ("name", "label", "kind", "version"):
+        assert root[field] == nested[field], field
+
+
+def test_root_and_nested_manifests_declare_the_same_environment():
+    """A drifted nested manifest silently changes what the installer asks for."""
+    root = _load("plugin.yaml")
+    nested = _load("plugins/vk/plugin.yaml")
+
+    assert _env_names(root, "requires_env") == _env_names(nested, "requires_env")
+    assert sorted(_env_names(root, "optional_env")) == sorted(_env_names(nested, "optional_env"))
+
+
+def test_manifest_version_matches_the_package_version():
+    import tomllib
+
+    manifest = _load("plugin.yaml")
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert manifest["version"] == pyproject["project"]["version"]
+
+
+def test_every_documented_env_var_is_declared_in_the_manifest():
+    """Anything the code reads must be discoverable by an operator."""
+    import re
+
+    manifest = _load("plugin.yaml")
+    declared = set(_env_names(manifest, "requires_env") + _env_names(manifest, "optional_env"))
+
+    reader = re.compile(r'(?:getenv|environ\.get|source\.get)\(\s*"(VK_[A-Z_]+)"')
+    used = set()
+    for path in (REPO_ROOT / "plugins").rglob("*.py"):
+        used.update(reader.findall(path.read_text(encoding="utf-8")))
+
+    assert used - declared == set(), f"undeclared env vars: {sorted(used - declared)}"
+
+
+def test_env_example_covers_every_declared_variable():
+    manifest = _load("plugin.yaml")
+    declared = set(_env_names(manifest, "requires_env") + _env_names(manifest, "optional_env"))
+    example = (REPO_ROOT / "config/.env.example").read_text(encoding="utf-8")
+
+    missing = {name for name in declared if name not in example}
+    assert missing == set(), f"missing from config/.env.example: {sorted(missing)}"
+
+
+def test_the_repository_ships_a_ci_workflow_that_runs_the_gates():
+    workflow = (REPO_ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+
+    for gate in ("pytest", "ruff", "pip check"):
+        assert gate in workflow, gate
