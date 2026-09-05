@@ -299,7 +299,7 @@ async def run_inbound(adapter, message, *, allowed=True):
     async def fake_extract_media(_message):
         from gateway.platforms.base import MessageType
 
-        return [], [], MessageType.TEXT
+        return [], [], MessageType.TEXT, []
 
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media

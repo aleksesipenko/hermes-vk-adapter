@@ -28,6 +28,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
 )
 
+from .attachments import summarize_attachment, summarize_message_context
 from .callbacks import PICKER_KIND, VKCallbackRouter
 from .capabilities import ClientCapabilities
 from .client import (
@@ -1021,13 +1022,21 @@ class VKAdapter(BasePlatformAdapter):
         await self._mark_read(peer_id, _safe_int(message.get("id"), 0))
         await self._react_processing(peer_id, inbound_cmid)
 
-        media_paths, media_types, inferred_type = await self._extract_media(message)
+        media_paths, media_types, inferred_type, notes = await self._extract_media(message)
         if text.startswith("/"):
             inferred_type = MessageType.COMMAND
         if not text and media_paths:
             text = self._default_media_text(inferred_type)
-        if not text and not media_paths:
+        if not text and not media_paths and not notes:
             return
+        if notes:
+            text = "\n".join(filter(None, [text, *notes]))
+
+        # Quoted replies and forwarded threads are content the user deliberately
+        # included; without them the agent answers a question it cannot see.
+        quoted = summarize_message_context(message)
+        if quoted:
+            text = f"{text}\n\n[VK quoted context]\n{quoted}" if text else quoted
 
         source = self.build_source(
             chat_id=str(peer_id),
@@ -1063,13 +1072,15 @@ class VKAdapter(BasePlatformAdapter):
 
     async def _extract_media(
         self, message: dict[str, Any]
-    ) -> tuple[list[str], list[str], MessageType]:
+    ) -> tuple[list[str], list[str], MessageType, list[str]]:
+        """Download what we can and describe what we cannot."""
         media_paths: list[str] = []
         media_types: list[str] = []
+        notes: list[str] = []
         inferred = MessageType.TEXT
         attachments = message.get("attachments") or []
         if not isinstance(attachments, list):
-            return media_paths, media_types, inferred
+            return media_paths, media_types, inferred, notes
 
         for attachment in attachments:
             if not isinstance(attachment, dict):
@@ -1119,9 +1130,21 @@ class VKAdapter(BasePlatformAdapter):
                         media_paths.append(await cache_audio_from_url(url, ext=ext))
                         media_types.append("audio/ogg" if ext == ".ogg" else "audio/mpeg")
                         inferred = MessageType.VOICE
+                else:
+                    # Not downloadable here (link, sticker, poll, video, wall,
+                    # story, ...). Describe it rather than drop it.
+                    summary = summarize_attachment(attachment)
+                    if summary:
+                        notes.append(summary)
             except Exception as exc:
-                logger.warning("VK attachment cache failed kind=%s: %s", kind, exc)
-        return media_paths, media_types, inferred
+                # One bad attachment must not cost the others.
+                logger.warning(
+                    "VK attachment cache failed kind=%s: %s", kind, redact_secrets(exc)
+                )
+                summary = summarize_attachment(attachment)
+                if summary:
+                    notes.append(f"{summary} (unavailable)")
+        return media_paths, media_types, inferred, notes
 
     def _default_media_text(self, message_type: MessageType) -> str:
         if message_type == MessageType.PHOTO:

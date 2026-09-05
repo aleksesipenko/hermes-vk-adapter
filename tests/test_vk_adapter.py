@@ -283,7 +283,7 @@ async def test_extract_audio_message_routes_voice_for_gateway_stt(monkeypatch):
 
     monkeypatch.setattr("plugins.vk.adapter.cache_audio_from_url", fake_cache_audio_from_url)
 
-    media_paths, media_types, message_type = await VKAdapter._extract_media(
+    media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
         {"attachments": [{"type": "audio_message", "audio_message": {"link_ogg": "https://vk.example/voice.ogg"}}]},
     )
@@ -304,7 +304,7 @@ async def test_extract_photo_routes_image_for_gateway_vision(monkeypatch):
 
     monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", fake_cache_image_from_url)
 
-    media_paths, media_types, message_type = await VKAdapter._extract_media(
+    media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
         {
             "attachments": [
@@ -344,7 +344,7 @@ async def test_extract_image_document_routes_as_photo_for_gateway_vision(monkeyp
 
     monkeypatch.setattr("plugins.vk.adapter.cache_image_from_bytes", fake_cache_image_from_bytes)
 
-    media_paths, media_types, message_type = await VKAdapter._extract_media(
+    media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
         {
             "attachments": [
@@ -385,7 +385,7 @@ async def test_extract_regular_document_uses_gateway_mime_type(monkeypatch):
         "plugins.vk.adapter.cache_document_from_bytes", fake_cache_document_from_bytes
     )
 
-    media_paths, media_types, message_type = await VKAdapter._extract_media(
+    media_paths, media_types, message_type, _notes = await VKAdapter._extract_media(
         adapter,
         {
             "attachments": [
@@ -421,7 +421,7 @@ async def test_group_slash_command_bypasses_mention_and_uses_command_type():
         captured.append(event)
 
     async def fake_extract_media(message):
-        return [], [], MessageType.TEXT
+        return [], [], MessageType.TEXT, []
 
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
@@ -464,7 +464,7 @@ async def test_group_reply_to_bot_activates_plain_text_message():
         captured.append(event)
 
     async def fake_extract_media(message):
-        return [], [], MessageType.TEXT
+        return [], [], MessageType.TEXT, []
 
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
@@ -833,3 +833,154 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
         )
         assert action is None, f"{kind} state survived a failed send"
         assert reason is not None
+
+
+# ── reply/forward/attachment context reaches Hermes (Task 9) ──────────────
+
+
+async def _capture_inbound(adapter, message):
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    adapter.handle_message = fake_handle_message
+    adapter.build_source = lambda **kw: None
+    adapter.group_id = 123456789
+    adapter.require_mention = False
+    adapter.allow_all_users = True
+    adapter.allowed_users = set()
+    adapter.mark_read_enabled = False
+    adapter._last_actor = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
+    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
+    adapter._capabilities = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
+    adapter._identities = _BoundedTTLCache(max_entries=8, ttl_seconds=600)
+    adapter.reactions = _ReactionConfig()
+    await VKAdapter._handle_message_new(adapter, message, {"type": "message_new"})
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_a_reply_and_a_forward_reach_the_agent_as_text():
+    adapter = object.__new__(VKAdapter)
+    adapter.client = None
+
+    async def no_media(_message):
+        return [], [], MessageType.TEXT, []
+
+    adapter._extract_media = no_media
+
+    captured = await _capture_inbound(
+        adapter,
+        {
+            "peer_id": 987654321,
+            "from_id": 987654321,
+            "id": 7,
+            "text": "what do you think?",
+            "reply_message": {"from_id": 5, "text": "the original proposal"},
+            "fwd_messages": [{"from_id": 6, "text": "a forwarded remark"}],
+        },
+    )
+
+    assert len(captured) == 1
+    text = captured[0].text
+    assert "what do you think?" in text
+    assert "the original proposal" in text
+    assert "a forwarded remark" in text
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_attachment_is_described_instead_of_dropped(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+    adapter.client = None
+
+    captured = await _capture_inbound(
+        adapter,
+        {
+            "peer_id": 987654321,
+            "from_id": 987654321,
+            "id": 8,
+            "text": "",
+            "attachments": [
+                {"type": "link", "link": {"url": "https://example.com", "title": "Example"}}
+            ],
+        },
+    )
+
+    assert len(captured) == 1
+    assert "https://example.com" in captured[0].text
+
+
+@pytest.mark.asyncio
+async def test_one_failing_attachment_preserves_the_others(monkeypatch):
+    adapter = object.__new__(VKAdapter)
+
+    async def exploding_cache(url, ext=".jpg"):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr("plugins.vk.adapter.cache_image_from_url", exploding_cache)
+
+    media_paths, _types, _kind, notes = await VKAdapter._extract_media(
+        adapter,
+        {
+            "attachments": [
+                {"type": "photo", "photo": {"sizes": [{"width": 1, "height": 1, "url": "u"}]}},
+                {"type": "poll", "poll": {"question": "Which one?"}},
+            ]
+        },
+    )
+
+    assert media_paths == []
+    assert any("unavailable" in note for note in notes)
+    assert any("Which one?" in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_multiple_images_go_out_as_one_native_photo_batch(tmp_path):
+    adapter = _idempotent_adapter()
+    uploaded = []
+
+    class PhotoClient(type(adapter.client)):
+        async def upload_photo_message_raw(self, *, peer_id, path):
+            uploaded.append(path)
+            return f"photo-1_{len(uploaded)}"
+
+    adapter.client = PhotoClient()
+    paths = []
+    for index in range(3):
+        image = tmp_path / f"shot{index}.png"
+        image.write_bytes(b"png")
+        paths.append(str(image))
+
+    result = await VKAdapter.send_media_auto(adapter, "987654321", paths, caption="three shots")
+
+    assert result.success
+    assert len(uploaded) == 3
+    assert len(adapter.client.sends) == 1
+    assert adapter.client.sends[0]["attachment"].count(",") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_photo_batch_still_delivers_via_documents(tmp_path):
+    adapter = _idempotent_adapter()
+    documents = []
+
+    class FailingPhotos(type(adapter.client)):
+        async def upload_photo_message_raw(self, *, peer_id, path):
+            raise RuntimeError("photos scope missing")
+
+        async def upload_document_raw(self, *, peer_id, path, title=None):
+            documents.append(path)
+            return f"doc-1_{len(documents)}"
+
+    adapter.client = FailingPhotos()
+    paths = []
+    for index in range(2):
+        image = tmp_path / f"shot{index}.png"
+        image.write_bytes(b"png")
+        paths.append(str(image))
+
+    result = await VKAdapter.send_media_auto(adapter, "987654321", paths, caption="shots")
+
+    assert result.success
+    assert documents == paths
