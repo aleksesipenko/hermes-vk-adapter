@@ -57,12 +57,18 @@ jobs:
       - name: Dependency consistency
         run: python -m pip check
 
-      - name: Packaging and import smoke
+      # Hermes installs this plugin as a directory, so the meaningful smoke is
+      # "does the plugin import when copied somewhere else", not "does a wheel
+      # build". A wheel here contains no plugin modules at all.
+      - name: Isolated import smoke (outside the checkout)
         run: |
-          python -m pip install --upgrade build
-          python -m build --wheel --outdir dist/
+          ISOLATED="$(mktemp -d)/hermes-vk-adapter"
+          mkdir -p "$ISOLATED"
+          cp -R plugins __init__.py plugin.yaml "$ISOLATED"/
+          cd "$ISOLATED"
           python - <<'PY'
-          import importlib
+          import importlib, sys
+          sys.path.insert(0, ".")
           for name in (
               "plugins.vk.client",
               "plugins.vk.utils",
@@ -75,7 +81,7 @@ jobs:
               "plugins.vk.doctor",
           ):
               importlib.import_module(name)
-          print("plugin modules import without Hermes and without a VK SDK")
+          print("plugin modules import from an isolated copy, without Hermes and without a VK SDK")
           PY
 
       - name: Manifest is valid YAML

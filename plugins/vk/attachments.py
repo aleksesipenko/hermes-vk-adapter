@@ -24,6 +24,9 @@ MAX_SUMMARY_CHARS = 200
 class ContextLimits:
     """Hard bounds on how much quoted context one message may contribute."""
 
+    #: All four are TOTALS for one walk, not per-message allowances. Applying
+    #: max_attachments per message let three forwards of five documents emit
+    #: fifteen lines under a "max_attachments=2" budget.
     max_depth: int = 3
     max_messages: int = 10
     max_text_chars: int = 2000
@@ -114,6 +117,7 @@ class _Budget:
         self.limits = limits
         self.messages = 0
         self.characters = 0
+        self.attachments = 0
         self.truncated = False
 
     def take_message(self) -> bool:
@@ -123,7 +127,17 @@ class _Budget:
         self.messages += 1
         return True
 
+    def take_attachments(self, count: int) -> int:
+        """How many of ``count`` attachments the remaining total budget allows."""
+        allowed = max(0, self.limits.max_attachments - self.attachments)
+        taken = min(count, allowed)
+        if taken < count:
+            self.truncated = True
+        self.attachments += taken
+        return taken
+
     def take_text(self, text: str) -> str:
+        """Charge ``text`` against the total character budget."""
         remaining = self.limits.max_text_chars - self.characters
         if remaining <= 0:
             self.truncated = True
@@ -157,19 +171,24 @@ def _summarize_one(
 
     summaries: list[str] = []
     attachments = message.get("attachments")
-    if isinstance(attachments, list):
-        for attachment in attachments[: budget.limits.max_attachments]:
+    if isinstance(attachments, list) and attachments:
+        allowed = budget.take_attachments(len(attachments))
+        for attachment in attachments[:allowed]:
             summary = summarize_attachment(attachment)
             if summary:
                 summaries.append(summary)
-        extra = len(attachments) - budget.limits.max_attachments
+        extra = len(attachments) - allowed
         if extra > 0:
             summaries.append(f"[+{extra} more attachments]")
     geo = _geo_summary(message)
     if geo:
         summaries.append(geo)
     if summaries:
-        parts.append(" ".join(summaries))
+        # Attachment lines are rendered text too, so they are charged against
+        # the same total character budget the message bodies use.
+        rendered = budget.take_text(" ".join(summaries))
+        if rendered:
+            parts.append(rendered)
 
     if parts:
         lines.append(f"{label} from {author}: {' '.join(parts)}"[:MAX_SUMMARY_CHARS * 4])

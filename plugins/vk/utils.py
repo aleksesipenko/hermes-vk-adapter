@@ -196,3 +196,9 @@ def _reaction_id(value: Any) -> int | None:
 # Resolved names/titles and negotiated client capabilities.
 IDENTITY_MAX_ENTRIES = 256
 IDENTITY_TTL_SECONDS = 600.0
+
+
+# Total inbound attachment work per message. Per-file byte limits alone let a
+# message with many attachments consume unbounded time and disk.
+MAX_INBOUND_ATTACHMENTS = 10
+MAX_INBOUND_DOWNLOAD_BYTES = 64 * 1024 * 1024

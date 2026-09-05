@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import mimetypes
 import os
@@ -52,6 +51,8 @@ from .utils import (
     IDENTITY_TTL_SECONDS,
     LAST_ACTOR_MAX_ENTRIES,
     LAST_ACTOR_TTL_SECONDS,
+    MAX_INBOUND_ATTACHMENTS,
+    MAX_INBOUND_DOWNLOAD_BYTES,
     OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
     OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
     SEEN_EVENT_MAX_ENTRIES,
@@ -69,6 +70,35 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _file_size(path: str) -> int:
+    """Size of a cached download, or 0 when it cannot be measured."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _describe_payload(payload: Any) -> str:
+    """Structural summary of a Long Poll payload -- never its contents.
+
+    VK_DEBUG_UPDATES used to dump the raw JSON, which carries message bodies,
+    callback payloads and attachment URLs (upload handles). Operators need to
+    know *what arrived*, not what people said.
+    """
+    if not isinstance(payload, dict):
+        return "<non-object payload>"
+    if payload.get("failed"):
+        return f"failed={_safe_int(payload.get('failed'), 0)}"
+    updates = payload.get("updates")
+    updates = updates if isinstance(updates, list) else []
+    kinds: dict[str, int] = {}
+    for update in updates:
+        if isinstance(update, dict):
+            kinds[str(update.get("type") or "?")] = kinds.get(str(update.get("type") or "?"), 0) + 1
+    summary = ", ".join(f"{kind}x{count}" for kind, count in sorted(kinds.items()))
+    return f"ts={payload.get('ts')} updates={len(updates)} [{summary}]"
 
 
 class VKAdapter(BasePlatformAdapter):
@@ -120,12 +150,6 @@ class VKAdapter(BasePlatformAdapter):
         self._approval_counter = 0
         # One bounded, expiring, actor-bound store for every interactive prompt.
         self._interactive = InteractiveStore()
-        # Who last spoke in each peer. Hermes' interactive hooks pass a chat_id
-        # but no user_id, and in a group chat the peer alone cannot say who the
-        # prompt is for -- see _actor_for_peer.
-        self._last_actor = BoundedTTLCache(
-            max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
-        )
         # The cmid of the last inbound message per peer -- VK keys reactions on
         # conversation_message_id, never on the global message id.
         self._last_inbound_cmid = BoundedTTLCache(
@@ -326,6 +350,7 @@ class VKAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("VK send failed peer_id=%s", peer_id)
+            await self._react_failed(peer_id)
             return self._failed_send(exc)
 
     async def send_document(
@@ -435,12 +460,40 @@ class VKAdapter(BasePlatformAdapter):
         return self._peer_capabilities(peer_id).supports_callback
 
     def _approval_fallback_text(self) -> str:
-        """Instructions for a client that cannot render callback buttons."""
+        """Instructions for a client that cannot render callback buttons.
+
+        Denial MUST use Hermes' ``/deny`` command. ``/approve`` parses only
+        "all", "session" and "always"; every other argument -- including the
+        word "deny" -- falls through to ``choice = "once"``, so telling a user
+        to type "/approve deny" would make them authorize the very command
+        they meant to block.
+        """
         prefix = getattr(self, "typed_command_prefix", "/")
         return (
-            f"Reply with {prefix}approve once, {prefix}approve session, "
-            f"{prefix}approve always, or {prefix}approve deny."
+            f"Reply {prefix}approve to allow once, "
+            f"{prefix}approve session to allow for this session, "
+            f"{prefix}approve always to allow permanently, "
+            f"or {prefix}deny to reject."
         )
+
+    @staticmethod
+    def _mark_awaiting_text(clarify_id: str) -> bool:
+        """Tell core to capture the next message as the clarify answer."""
+        try:
+            from tools.clarify_gateway import mark_awaiting_text
+
+            return bool(mark_awaiting_text(clarify_id))
+        except Exception as exc:
+            logger.warning("VK clarify text capture failed: %s", type(exc).__name__)
+            return False
+
+    def _slash_confirm_fallback_text(self) -> str:
+        prefix = getattr(self, "typed_command_prefix", "/")
+        return f"Reply {prefix}approve to confirm, or {prefix}deny to cancel."
+
+    def _model_picker_fallback_text(self) -> str:
+        prefix = getattr(self, "typed_command_prefix", "/")
+        return f"Reply {prefix}model <model-id> to switch models."
 
     def _clarify_fallback_text(self, choices: list) -> str:
         lines = [f"{index}. {choice}" for index, choice in enumerate(choices[:8], start=1)]
@@ -533,7 +586,22 @@ class VKAdapter(BasePlatformAdapter):
         chunks = chunk_vk_text(self.format_message(content or ""), VK_MESSAGE_EDIT_LIMIT)
         if not chunks:
             chunks = [""]
+
         try:
+            if not finalize and len(chunks) > 1:
+                # Streaming preview. The stream consumer calls this repeatedly
+                # with the WHOLE accumulated answer, so emitting continuations
+                # here would post the tail again on every tick and leave the
+                # already-visible prefix duplicated. Rewrite the one message
+                # with a bounded preview and create nothing irreversible; the
+                # finalize call below delivers the full text exactly once.
+                await self.client.edit_message(
+                    peer_id=peer_id,
+                    message_id=target_id,
+                    message=self._streaming_preview(chunks[0]),
+                )
+                return SendResult(success=True, message_id=str(target_id))
+
             await self.client.edit_message(
                 peer_id=peer_id, message_id=target_id, message=chunks[0]
             )
@@ -554,6 +622,14 @@ class VKAdapter(BasePlatformAdapter):
             message_id=sent_ids[-1],
             continuation_message_ids=tuple(sent_ids[:-1]),
         )
+
+    @staticmethod
+    def _streaming_preview(head: str) -> str:
+        """A bounded in-progress preview that still fits VK's edit limit."""
+        marker = " ..."
+        if len(head) + len(marker) <= VK_MESSAGE_EDIT_LIMIT:
+            return head + marker
+        return head[: VK_MESSAGE_EDIT_LIMIT - len(marker)] + marker
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete one of our messages. Best-effort: never raises."""
@@ -585,6 +661,20 @@ class VKAdapter(BasePlatformAdapter):
         if not reaction_id or not cmid or not self.client:
             return
         await self._react(peer_id, cmid, reaction_id)
+
+    async def _react_failed(self, peer_id: int) -> None:
+        """Mark the inbound message when *our own* delivery failed.
+
+        This is the only failure the adapter can honestly observe. Hermes
+        exposes no agent-run-failed hook to a platform adapter, so this never
+        claims to reflect whether the agent itself succeeded.
+        """
+        reaction_id = self.reactions.failed
+        if not reaction_id or not self.client:
+            return
+        cmid = _safe_int(self._last_inbound_cmid.get(peer_id), 0)
+        if cmid:
+            await self._react(peer_id, cmid, reaction_id)
 
     async def _react_done(self, peer_id: int) -> None:
         """Close out the lifecycle reaction on the message we replied to."""
@@ -831,10 +921,7 @@ class VKAdapter(BasePlatformAdapter):
                     self.longpoll_state = await self.client.get_long_poll_state()
                 payload = await self.client.poll(self.longpoll_state, self.wait_seconds)
                 if self.debug_updates:
-                    logger.info(
-                        "VK Long Poll payload: %s",
-                        json.dumps(payload, ensure_ascii=False)[:4000],
-                    )
+                    logger.info("VK Long Poll payload: %s", _describe_payload(payload))
                 # A response arrived: the transport is healthy again, whatever
                 # the response says.
                 self._note_poll_success()
@@ -978,11 +1065,19 @@ class VKAdapter(BasePlatformAdapter):
                 return
             logger.debug("VK update ignored: type=%s", update.get("type"))
             return
-        message = (update.get("object") or {}).get("message") or {}
-        await self._handle_message_new(message, update)
+        event = update.get("object") or {}
+        message = event.get("message") or {}
+        # VK puts client_info as a sibling of `message` inside `object`, not
+        # inside the message itself. Reading it from the message made every
+        # client look incapable, which silently disabled callback buttons.
+        await self._handle_message_new(message, update, client_info=event.get("client_info"))
 
     async def _handle_message_new(
-        self, message: dict[str, Any], raw_update: dict[str, Any]
+        self,
+        message: dict[str, Any],
+        raw_update: dict[str, Any],
+        *,
+        client_info: Any = None,
     ) -> None:
         peer_id = _safe_int(message.get("peer_id"), 0)
         from_id = _safe_int(message.get("from_id"), 0)
@@ -1009,13 +1104,10 @@ class VKAdapter(BasePlatformAdapter):
         ):
             return
 
-        # Remember who spoke: an interactive prompt raised during this turn is
-        # bound to them (Hermes' hooks pass no user_id).
-        self._last_actor.set(peer_id, from_id)
         # Only now -- after the allowlist accepted the sender. Acknowledging
         # earlier would confirm to a stranger that the bot is live and read
         # their message.
-        self._remember_capabilities(peer_id, message.get("client_info"))
+        self._remember_capabilities(peer_id, client_info or message.get("client_info"))
         inbound_cmid = _safe_int(message.get("conversation_message_id"), 0)
         if inbound_cmid:
             self._last_inbound_cmid.set(peer_id, inbound_cmid)
@@ -1082,15 +1174,27 @@ class VKAdapter(BasePlatformAdapter):
         if not isinstance(attachments, list):
             return media_paths, media_types, inferred, notes
 
-        for attachment in attachments:
+        if len(attachments) > MAX_INBOUND_ATTACHMENTS:
+            notes.append(
+                f"[+{len(attachments) - MAX_INBOUND_ATTACHMENTS} more attachments not processed]"
+            )
+        downloaded_bytes = 0
+        for attachment in attachments[:MAX_INBOUND_ATTACHMENTS]:
             if not isinstance(attachment, dict):
                 continue
             kind = attachment.get("type")
+            if downloaded_bytes >= MAX_INBOUND_DOWNLOAD_BYTES:
+                summary = summarize_attachment(attachment)
+                if summary:
+                    notes.append(f"{summary} (skipped: download budget exhausted)")
+                continue
             try:
                 if kind == "photo":
                     url = _largest_photo_url(attachment.get("photo") or {})
                     if url:
-                        media_paths.append(await cache_image_from_url(url, ext=".jpg"))
+                        path = await cache_image_from_url(url, ext=".jpg")
+                        downloaded_bytes += _file_size(path)
+                        media_paths.append(path)
                         media_types.append("image/jpeg")
                         inferred = MessageType.PHOTO
                 elif kind == "doc":
@@ -1099,7 +1203,10 @@ class VKAdapter(BasePlatformAdapter):
                     title = doc.get("title") or f"vk_doc_{doc.get('id', 'unknown')}"
                     if url:
                         assert self.client is not None
-                        data = await self.client.download_bytes(url)
+                        data = await self.client.download_bytes(
+                            url, max_bytes=MAX_INBOUND_DOWNLOAD_BYTES - downloaded_bytes
+                        )
+                        downloaded_bytes += len(data)
                         raw_ext = str(doc.get("ext") or "").strip().lower()
                         ext = f".{raw_ext}" if raw_ext and not raw_ext.startswith(".") else raw_ext
                         if not ext:
@@ -1127,7 +1234,9 @@ class VKAdapter(BasePlatformAdapter):
                     url = audio.get("link_ogg") or audio.get("link_mp3")
                     if url:
                         ext = ".ogg" if audio.get("link_ogg") else ".mp3"
-                        media_paths.append(await cache_audio_from_url(url, ext=ext))
+                        path = await cache_audio_from_url(url, ext=ext)
+                        downloaded_bytes += _file_size(path)
+                        media_paths.append(path)
                         media_types.append("audio/ogg" if ext == ".ogg" else "audio/mpeg")
                         inferred = MessageType.VOICE
                 else:
@@ -1156,11 +1265,21 @@ class VKAdapter(BasePlatformAdapter):
         return "[VK attachment]"
 
     def _is_allowed_vk_user(self, from_id: int) -> bool:
+        """Adapter-side gate for inbound *side effects*.
+
+        This mirrors the contract registered via ``allowed_users_env`` /
+        ``allow_all_env``: access is granted by an explicit allowlist or an
+        explicit allow-all, never by the absence of configuration. It used to
+        return True when neither was set, which meant a stranger's message was
+        marked read and reacted to before Hermes' own default-deny check ever
+        ran -- confirming to them that the bot is live and reading.
+
+        Hermes still performs its own authorization; this only decides whether
+        the adapter may produce a visible acknowledgement.
+        """
         if self.allow_all_users:
             return True
-        if self.allowed_users:
-            return str(from_id) in self.allowed_users
-        return True
+        return bool(self.allowed_users) and str(from_id) in self.allowed_users
 
     def _is_group_activation(self, text: str, message: dict[str, Any] | None = None) -> bool:
         if not text:
@@ -1185,23 +1304,48 @@ class VKAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         return render_vk_plain_text(content)
 
-    def _actor_for_peer(self, peer_id: int) -> int:
-        """The VK user an interactive prompt in this peer belongs to.
+    def _provable_actor(self, peer_id: int, session_key: str) -> int | None:
+        """The VK user a prompt binds to, or None when it cannot be proven.
 
         Hermes' interactive hooks pass a chat_id and a session key but no
-        user_id, so the actor has to be recovered here:
+        user_id. Two sources of truth are acceptable:
 
-        * in a DM the peer *is* the user, which is exact;
-        * in a group chat, the prompt is always a response to the turn we just
-          handled, so the last inbound sender in that peer is the right actor.
+        * a DM peer *is* the user id, which is exact;
+        * a per-user group session key ends with the participant id that Hermes
+          itself derived from the triggering message
+          (``<ns>:vk:group:<chat_id>:<user_id>``), validated here against the
+          peer we are answering in.
 
-        If neither is known the prompt is registered with user 0, which the
-        store treats as peer-bound only. That is weaker than actor-bound, but
-        refusing to render the prompt at all would strand the turn.
+        Anything else -- a shared group session, an unparsable key -- returns
+        None. Tracking "the last user who spoke in this peer" was tried and is
+        NOT acceptable: base ``handle_message()`` schedules processing in the
+        background and returns, so a second user speaking before the first
+        user's approval hook runs would silently rebind the prompt to them.
         """
-        if 0 < peer_id < GROUP_PEER_ID_BASE:
+        if peer_id <= 0:
+            return None
+        if peer_id < GROUP_PEER_ID_BASE:
             return peer_id
-        return _safe_int(self._last_actor.get(peer_id), 0)
+        parts = str(session_key or "").split(":")
+        marker = str(peer_id)
+        for index, part in enumerate(parts[:-1]):
+            if part != marker:
+                continue
+            candidate = parts[index + 1]
+            if candidate.isdigit() and int(candidate) > 0 and candidate != marker:
+                return int(candidate)
+        return None
+
+    def _interactive_binding(self, peer_id: int, session_key: str) -> tuple[int | None, bool]:
+        """(actor, may_use_callbacks) for one interactive prompt.
+
+        Callback buttons are only offered when we can both prove who the actor
+        is and know the client renders them. Otherwise the surface degrades to
+        a typed fallback, which Hermes resolves through its own commands and
+        needs no local state at all.
+        """
+        actor = self._provable_actor(peer_id, session_key)
+        return actor, bool(actor) and self._callbacks_supported(peer_id)
 
     def _keyboard_factory(self) -> VKKeyboardFactory:
         factory = getattr(self, "_keyboards", None)
@@ -1246,20 +1390,21 @@ class VKAdapter(BasePlatformAdapter):
         return chunk_vk_text(self.format_message(text or ""), self._send_limit())
 
     def _chunk_random_id(self, peer_id: int, index: int, rendered: str) -> int:
-        """A ``random_id`` that is stable across retries of one logical chunk.
+        """A fresh ``random_id`` for one chunk of one send invocation.
 
-        VK deduplicates ``messages.send`` by ``random_id``, so a retry -- ours
-        after a timeout, or the gateway's after a ``retryable`` SendResult --
-        must present the same value or it becomes a second visible message.
-        The id is cached under a content key for a short window: long enough to
-        cover any retry of *this* send, short enough that the user genuinely
-        repeating a message later still gets a fresh id instead of silently
-        colliding with the earlier one.
+        VK deduplicates ``messages.send`` by ``random_id``. Transport retries
+        must therefore reuse the id -- and they do, because
+        ``VKRestClient.call_idempotent`` re-issues the *same built params*.
+
+        What must NOT happen is two distinct sends sharing an id. Caching by
+        content digest did exactly that: an agent legitimately replying "Done."
+        twice within the cache window had the second reply swallowed by VK.
+        So the id is minted per chunk, per invocation, and never keyed on the
+        text.
         """
         assert self.client is not None
-        digest = hashlib.blake2b(rendered.encode("utf-8"), digest_size=16).hexdigest()
-        key = (peer_id, index, digest)
-        return self._outbound_random_ids.setdefault(key, self.client.new_random_id)
+        del index, rendered  # deliberately not part of the identity
+        return self.client.new_random_id()
 
     @staticmethod
     def _failed_send(exc: BaseException, *, error: str | None = None) -> SendResult:
@@ -1286,25 +1431,27 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         self._approval_counter += 1
         approval_id = self._approval_counter
-        self._interactive.register(
-            kind="ea",
-            action_id=approval_id,
-            user_id=self._actor_for_peer(peer_id),
-            peer_id=peer_id,
-            session_key=session_key,
-        )
+        actor, use_callbacks = self._interactive_binding(peer_id, session_key)
+        if use_callbacks:
+            self._interactive.register(
+                kind="ea",
+                action_id=approval_id,
+                user_id=actor,
+                peer_id=peer_id,
+                session_key=session_key,
+            )
         preview = command[:1800] + "..." if len(command) > 1800 else command
         text = f"Command approval required\n\n{preview}\n\nReason: {description}"
-        # A client that cannot render callback buttons still has to be able to
-        # answer, so fall back to Hermes' typed approval command.
-        supported = self._callbacks_supported(peer_id)
-        if not supported:
+        # Without callback buttons -- unsupported client, or an actor we
+        # cannot prove -- the user still has to be able to answer, so fall back
+        # to Hermes' own typed commands.
+        if not use_callbacks:
             text = f"{text}\n\n{self._approval_fallback_text()}"
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
                 message=self.format_message(text),
-                keyboard=self._approval_keyboard(approval_id) if supported else None,
+                keyboard=self._approval_keyboard(approval_id) if use_callbacks else None,
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
@@ -1325,18 +1472,23 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
-        self._interactive.register(
-            kind="sc",
-            action_id=confirm_id,
-            user_id=self._actor_for_peer(peer_id),
-            peer_id=peer_id,
-            session_key=session_key,
-        )
+        actor, use_callbacks = self._interactive_binding(peer_id, session_key)
+        body = message
+        if use_callbacks:
+            self._interactive.register(
+                kind="sc",
+                action_id=confirm_id,
+                user_id=actor,
+                peer_id=peer_id,
+                session_key=session_key,
+            )
+        else:
+            body = f"{message}\n\n{self._slash_confirm_fallback_text()}"
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
-                message=self.format_message(message),
-                keyboard=self._slash_confirm_keyboard(confirm_id),
+                message=self.format_message(body),
+                keyboard=self._slash_confirm_keyboard(confirm_id) if use_callbacks else None,
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
@@ -1358,7 +1510,10 @@ class VKAdapter(BasePlatformAdapter):
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
-        if clean_choices and self._callbacks_supported(peer_id):
+        actor, use_callbacks = self._interactive_binding(peer_id, session_key)
+        buttons = bool(clean_choices) and use_callbacks
+
+        if buttons:
             lines = [f"Question: {question}", ""]
             lines.extend(
                 f"{index}. {choice}"
@@ -1366,44 +1521,44 @@ class VKAdapter(BasePlatformAdapter):
             )
             keyboard = self._clarify_keyboard(clean_choices, clarify_id)
         elif clean_choices:
-            # No callback support: a numbered list the user answers by typing.
             lines = [f"Question: {question}", "", self._clarify_fallback_text(clean_choices)]
             keyboard = None
-            try:
-                from tools.clarify_gateway import mark_awaiting_text
-
-                mark_awaiting_text(clarify_id)
-            except Exception as exc:
-                logger.debug("VK clarify text fallback failed: %s", type(exc).__name__)
         else:
             lines = [f"Question: {question}", "", "Reply in this chat with your answer."]
             keyboard = None
-            try:
-                from tools.clarify_gateway import mark_awaiting_text
 
-                mark_awaiting_text(clarify_id)
-            except Exception:
-                pass
-        # The choices are recorded here so resolving a tap never has to read
-        # Hermes' private clarify_gateway state.
-        self._interactive.register(
-            kind="cl",
-            action_id=clarify_id,
-            user_id=self._actor_for_peer(peer_id),
-            peer_id=peer_id,
-            session_key=session_key,
-            data={"choices": clean_choices[:8]},
-        )
+        if buttons:
+            self._interactive.register(
+                kind="cl",
+                action_id=clarify_id,
+                user_id=actor,
+                peer_id=peer_id,
+                session_key=session_key,
+                data={"choices": clean_choices[:8]},
+            )
+
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
                 message=self.format_message("\n".join(lines)),
                 keyboard=keyboard,
             )
-            return SendResult(success=True, message_id=str(response))
         except Exception as exc:
             self._interactive.discard("cl", clarify_id)
             return self._failed_send(exc)
+
+        if not buttons:
+            # Arm the typed-answer path only now. Doing it before the send
+            # meant a failed send still left core waiting to consume the
+            # user's next, unrelated message as the clarify answer.
+            if not self._mark_awaiting_text(clarify_id):
+                return SendResult(
+                    success=False,
+                    error="VK clarify prompt was delivered but Hermes never armed text capture",
+                    retryable=False,
+                    error_kind="unknown",
+                )
+        return SendResult(success=True, message_id=str(response))
 
     async def send_model_picker(
         self,
@@ -1421,25 +1576,30 @@ class VKAdapter(BasePlatformAdapter):
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         picker_id = secrets.token_hex(4)
-        self._interactive.register(
-            kind=PICKER_KIND,
-            action_id=picker_id,
-            user_id=self._actor_for_peer(peer_id),
-            peer_id=peer_id,
-            session_key=session_key,
-            data={
-                "providers": providers,
-                "on_model_selected": on_model_selected,
-                "current_model": current_model,
-                "current_provider": current_provider,
-                "provider_page": 0,
-            },
-        )
+        actor, use_callbacks = self._interactive_binding(peer_id, session_key)
+        text = model_picker_provider_text(providers, current_model, current_provider)
+        if use_callbacks:
+            self._interactive.register(
+                kind=PICKER_KIND,
+                action_id=picker_id,
+                user_id=actor,
+                peer_id=peer_id,
+                session_key=session_key,
+                data={
+                    "providers": providers,
+                    "on_model_selected": on_model_selected,
+                    "current_model": current_model,
+                    "current_provider": current_provider,
+                    "provider_page": 0,
+                },
+            )
+        else:
+            text = f"{text}\n\n{self._model_picker_fallback_text()}"
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
-                message=model_picker_provider_text(providers, current_model, current_provider),
-                keyboard=self._provider_keyboard(providers, picker_id),
+                message=text,
+                keyboard=self._provider_keyboard(providers, picker_id) if use_callbacks else None,
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:

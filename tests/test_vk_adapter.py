@@ -87,12 +87,18 @@ def test_group_activation_requires_command_mention_or_hermes_word():
     assert not VKAdapter._is_group_activation(adapter, "ordinary chat noise")
 
 
-def test_allowed_users_defaults_to_allow_when_gateway_policy_handles_auth():
+def test_inbound_side_effects_need_explicit_authorization():
+    """Absence of configuration is not consent.
+
+    This used to return True when neither VK_ALLOWED_USERS nor
+    VK_ALLOW_ALL_USERS was set, so a stranger's message was marked read and
+    reacted to before Hermes' own default-deny check ran.
+    """
     adapter = object.__new__(VKAdapter)
     adapter.allow_all_users = False
     adapter.allowed_users = set()
 
-    assert VKAdapter._is_allowed_vk_user(adapter, 987654321)
+    assert not VKAdapter._is_allowed_vk_user(adapter, 987654321)
 
     adapter.allowed_users = {"987654321"}
     assert VKAdapter._is_allowed_vk_user(adapter, 987654321)
@@ -334,8 +340,9 @@ async def test_extract_image_document_routes_as_photo_for_gateway_vision(monkeyp
     adapter = object.__new__(VKAdapter)
 
     class FakeClient:
-        async def download_bytes(self, url: str):
+        async def download_bytes(self, url: str, *, max_bytes: int | None = None):
             assert url == "https://vk.example/screenshot.png"
+            assert max_bytes is None or max_bytes > 0
             return b"\x89PNG\r\n\x1a\nfake"
 
     adapter.client = FakeClient()
@@ -373,8 +380,9 @@ async def test_extract_regular_document_uses_gateway_mime_type(monkeypatch):
     adapter = object.__new__(VKAdapter)
 
     class FakeClient:
-        async def download_bytes(self, url: str):
+        async def download_bytes(self, url: str, *, max_bytes: int | None = None):
             assert url == "https://vk.example/report.pdf"
+            assert max_bytes is None or max_bytes > 0
             return b"%PDF-1.7"
 
     adapter.client = FakeClient()
@@ -653,8 +661,14 @@ def _idempotent_adapter():
 
 
 @pytest.mark.asyncio
-async def test_repeated_send_of_identical_content_reuses_one_random_id():
-    """A gateway-level retry must not become a second visible VK message."""
+async def test_each_send_invocation_gets_its_own_random_id():
+    """Retry stability lives in the client, not in a content-keyed cache.
+
+    Sharing an id across two distinct sends made VK swallow the second when an
+    agent legitimately replied with the same text twice. Transport retries stay
+    stable because call_idempotent re-issues the same built params; see
+    tests/test_vk_review_regressions.py.
+    """
     adapter = _idempotent_adapter()
 
     first = await VKAdapter.send(adapter, chat_id="987654321", content="same text")
@@ -663,8 +677,8 @@ async def test_repeated_send_of_identical_content_reuses_one_random_id():
     assert first.success and second.success
     random_ids = [call["random_id"] for call in adapter.client.sends]
     assert len(random_ids) == 2
-    assert random_ids[0] == random_ids[1]
-    assert random_ids[0] > 0
+    assert random_ids[0] != random_ids[1]
+    assert all(value > 0 for value in random_ids)
 
 
 @pytest.mark.asyncio

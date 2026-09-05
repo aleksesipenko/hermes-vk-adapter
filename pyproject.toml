@@ -32,5 +32,10 @@ select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+# Hermes installs this plugin by copying/discovering the repository directory
+# (`hermes plugins install <repo>`), not from a wheel. Nothing is packaged on
+# purpose: `pip install -e ".[dev]"` exists only to provide the dev toolchain.
+# Building a wheel would produce a dist-info-only artifact, which is why CI
+# tests the real discovery path instead of a packaging smoke.
 [tool.setuptools]
 packages = []

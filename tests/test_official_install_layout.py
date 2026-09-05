@@ -116,3 +116,23 @@ def test_the_repository_ships_a_ci_workflow_that_runs_the_gates():
 
     for gate in ("pytest", "ruff", "pip check"):
         assert gate in workflow, gate
+
+
+def test_the_repository_does_not_claim_a_meaningful_wheel():
+    """Hermes installs this plugin as a directory, not from a wheel.
+
+    `[tool.setuptools] packages = []` builds a dist-info-only artifact, so a
+    CI "packaging smoke" that then imports from the checkout is false green.
+    Either package the modules or do not claim to test packaging.
+    """
+    import tomllib
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    packaged = pyproject.get("tool", {}).get("setuptools", {}).get("packages")
+    workflow = (REPO_ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+
+    if not packaged:
+        assert "build --wheel" not in workflow, (
+            "CI builds a wheel that contains no plugin modules"
+        )
+        assert "Isolated import smoke" in workflow

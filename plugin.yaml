@@ -59,7 +59,7 @@ optional_env:
     secret: false
     password: false
   - name: VK_DEBUG_UPDATES
-    description: Логировать raw Long Poll updates для диагностики
+    description: 'Логировать структуру Long Poll updates (ts, количество и типы). Тексты сообщений и payload не логируются.'
     prompt: Диагностировать VK updates
     secret: false
     password: false

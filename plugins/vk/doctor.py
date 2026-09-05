@@ -38,6 +38,15 @@ REQUIRED_LONGPOLL_EVENTS = ("message_new", "message_event")
 
 _API_VERSION_RE = re.compile(r"^\d+\.\d+$")
 
+def _positive_int(value: Any) -> int:
+    """``value`` as a positive int, else 0. VK ids are never <= 0."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
 _STATUS_MARK = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL", "skip": "skip"}
 
 
@@ -134,6 +143,15 @@ async def run_live_checks(
 ) -> list[CheckResult]:
     """Read-only VK probes. Creates, edits and sends nothing."""
     results: list[CheckResult] = []
+    # Both Long Poll methods are community-scoped and require a real group_id;
+    # sending None made VK reject them for reasons unrelated to what we probe.
+    group_id = _positive_int(getattr(client, "group_id", 0))
+    if not group_id:
+        return [
+            CheckResult(
+                "group_id", "fail", "client has no positive numeric group id to query with"
+            )
+        ]
 
     failure, permissions = await _guarded(
         "token_permissions", client.call("groups.getTokenPermissions")
@@ -144,7 +162,8 @@ async def run_live_checks(
         results.append(_check_permissions(permissions))
 
     failure, settings = await _guarded(
-        "longpoll_settings", client.call("groups.getLongPollSettings", group_id=None)
+        "longpoll_settings",
+        client.call("groups.getLongPollSettings", group_id=group_id),
     )
     if failure:
         results.append(failure)
@@ -152,7 +171,8 @@ async def run_live_checks(
         results.extend(_check_longpoll_settings(settings, api_version))
 
     failure, server = await _guarded(
-        "longpoll_server", client.call("groups.getLongPollServer", group_id=None)
+        "longpoll_server",
+        client.call("groups.getLongPollServer", group_id=group_id),
     )
     if failure:
         results.append(failure)
@@ -238,6 +258,7 @@ def _check_longpoll_settings(settings: Any, api_version: str) -> list[CheckResul
 
 
 async def _check_home_peer(client: Any, home_peer_id: int | None) -> CheckResult:
+    home_peer_id = _positive_int(home_peer_id)
     if not home_peer_id:
         return CheckResult("home_peer", "skip", "no home peer configured")
     failure, conversation = await _guarded(
@@ -257,9 +278,11 @@ async def _check_home_peer(client: Any, home_peer_id: int | None) -> CheckResult
 
 async def run_send_smoke(client: Any, *, peer_id: int | None) -> CheckResult:
     """The only mode that writes. Requires an explicit target."""
-    if not peer_id:
+    if not _positive_int(peer_id):
         return CheckResult(
-            "send_smoke", "fail", "--send-smoke requires --peer-id; refusing to guess a target"
+            "send_smoke",
+            "fail",
+            "--send-smoke requires a positive --peer-id; refusing to guess a target",
         )
     try:
         response = await client.send_message(

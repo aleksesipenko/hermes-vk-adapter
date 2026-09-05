@@ -23,6 +23,8 @@ GOOD_ENV = {"VK_GROUP_TOKEN": TOKEN, "VK_GROUP_ID": "123456789", "VK_API_VERSION
 
 
 class FakeClient:
+    group_id = 123456789
+
     def __init__(self, **responses):
         self.responses = responses
         self.calls = []
