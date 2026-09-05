@@ -64,40 +64,46 @@ class VKKeyboardFactory:
         buttons.append(_cb("Other", h="cl", id=clarify_id, c="other"))
         return self._keyboard_json(_chunk_buttons(buttons, size=2), inline=True)
 
-    def provider_keyboard(self, providers: list, page: int = 0) -> str:
+    def provider_keyboard(self, providers: list, action_id: str, page: int = 0) -> str:
         page = _bounded_page(page, len(providers), PROVIDER_PAGE_SIZE)
         start = page * PROVIDER_PAGE_SIZE
         visible = providers[start : start + PROVIDER_PAGE_SIZE]
         buttons = [
-            _cb(str(offset + 1), h="mpc", pg=page, p=start + offset)
+            _cb(str(offset + 1), h="mpc", i=action_id, pg=page, p=start + offset)
             for offset, _provider in enumerate(visible)
         ]
         rows = _chunk_buttons(buttons, size=3)
-        nav = [_cb("Close", h="mc")]
+        nav = [_cb("Close", h="mc", i=action_id)]
         if page > 0:
-            nav.append(_cb("Prev", h="mp", pg=page - 1))
+            nav.append(_cb("Prev", h="mp", i=action_id, pg=page - 1))
         if start + PROVIDER_PAGE_SIZE < len(providers):
-            nav.append(_cb("Next", h="mp", pg=page + 1))
+            nav.append(_cb("Next", h="mp", i=action_id, pg=page + 1))
         rows.extend(_chunk_buttons(nav, size=3))
         return self._keyboard_json(rows, inline=True)
 
-    def model_keyboard(self, provider: dict[str, Any], provider_index: int, page: int = 0) -> str:
+    def model_keyboard(
+        self,
+        provider: dict[str, Any],
+        action_id: str,
+        provider_index: int,
+        page: int = 0,
+    ) -> str:
         models = provider.get("models") or []
         page = _bounded_page(page, len(models), MODEL_PAGE_SIZE)
         start = page * MODEL_PAGE_SIZE
         visible = models[start : start + MODEL_PAGE_SIZE]
         buttons = [
-            _cb(str(offset + 1), h="mm", p=provider_index, pg=page, m=start + offset)
+            _cb(str(offset + 1), h="mm", i=action_id, p=provider_index, pg=page, m=start + offset)
             for offset, _model_id in enumerate(visible)
         ]
         rows = _chunk_buttons(buttons, size=3)
-        nav = [_cb("Back", h="mb")]
+        nav = [_cb("Back", h="mb", i=action_id)]
         if page > 0:
-            nav.append(_cb("Prev", h="mmp", p=provider_index, pg=page - 1))
+            nav.append(_cb("Prev", h="mmp", i=action_id, p=provider_index, pg=page - 1))
         if start + MODEL_PAGE_SIZE < len(models):
-            nav.append(_cb("Next", h="mmp", p=provider_index, pg=page + 1))
+            nav.append(_cb("Next", h="mmp", i=action_id, p=provider_index, pg=page + 1))
         rows.extend(_chunk_buttons(nav, size=3))
-        rows.append([_cb("Close", h="mc")])
+        rows.append([_cb("Close", h="mc", i=action_id)])
         return self._keyboard_json(rows, inline=True)
 
     def _keyboard_json(self, rows: list[list[dict[str, Any]]], *, inline: bool) -> str:

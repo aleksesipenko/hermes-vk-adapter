@@ -1,16 +1,52 @@
-"""VK callback button routing for Hermes interactive surfaces."""
+"""VK callback button routing for Hermes interactive surfaces.
+
+Every branch here follows the same order, and the order is the security
+property:
+
+    claim the VK event -> check the allowlist -> authorize against the
+    recorded actor -> resolve in Hermes -> only then forget the state
+
+Resolving before authorizing would let any allowlisted user answer another
+user's approval prompt.  Forgetting the state before resolving -- which is what
+popping the dict up front used to do -- turns a transient resolver failure into
+a prompt nobody can ever answer.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from .formatting import render_vk_plain_text
+from .interactive import (
+    REJECT_EXPIRED,
+    REJECT_FOREIGN_PEER,
+    REJECT_FOREIGN_USER,
+    REJECT_RESOLVED,
+    REJECT_UNKNOWN,
+    InteractiveStore,
+    PendingAction,
+)
 from .keyboards import VKKeyboardFactory, model_picker_model_text, model_picker_provider_text
-from .utils import _safe_int
+from .utils import _safe_int, decode_callback_payload
 
 logger = logging.getLogger(__name__)
+
+#: What the user sees in the VK snackbar. Deliberately vague: the reason codes
+#: are for our logs, not for telling a stranger whose prompt they just hit.
+_REJECTION_TEXT = {
+    REJECT_UNKNOWN: "This action is no longer available",
+    REJECT_EXPIRED: "This action expired",
+    REJECT_RESOLVED: "Already resolved",
+    REJECT_FOREIGN_USER: "This action belongs to someone else",
+    REJECT_FOREIGN_PEER: "This action belongs to another chat",
+}
+
+APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+SLASH_CONFIRM_CHOICES = frozenset({"once", "always", "cancel"})
+
+#: Store kind for the model picker; its callbacks carry the id as "i".
+PICKER_KIND = "mp"
 
 
 class VKCallbackRouter:
@@ -21,352 +57,323 @@ class VKCallbackRouter:
         is_allowed_user,
         keyboards: VKKeyboardFactory,
         command_keyboard_enabled: bool,
-        approval_state: dict[int, str],
-        slash_confirm_state: dict[str, str],
-        clarify_state: dict[str, str],
-        model_picker_state: dict[str, dict[str, Any]],
+        store: InteractiveStore,
     ) -> None:
         self.client = client
         self.is_allowed_user = is_allowed_user
         self.keyboards = keyboards
         self.command_keyboard_enabled = command_keyboard_enabled
-        self.approval_state = approval_state
-        self.slash_confirm_state = slash_confirm_state
-        self.clarify_state = clarify_state
-        self.model_picker_state = model_picker_state
+        self.store = store
 
     async def handle(self, event: dict[str, Any]) -> None:
-        payload = decode_payload(event.get("payload"))
-        if not payload:
-            return
+        payload = decode_callback_payload(event.get("payload"))
         user_id = _safe_int(event.get("user_id"), 0)
         peer_id = _safe_int(event.get("peer_id"), 0)
         event_id = str(event.get("event_id") or "")
         cmid = _safe_int(event.get("conversation_message_id"), 0)
         if not user_id or not peer_id:
+            logger.debug("VK callback ignored: missing user_id/peer_id")
+            return
+
+        ctx = _CallbackContext(self, event_id, user_id, peer_id, cmid)
+        # One VK event gets at most one answer, whatever happens below.
+        if not self.store.claim_event(event_id):
+            logger.info("VK callback replay suppressed for peer_id=%s", peer_id)
+            return
+        if not payload:
+            await ctx.answer("Unsupported action")
             return
         if not self.is_allowed_user(user_id):
-            await self._answer(event_id, user_id, peer_id, "Not authorized")
+            logger.info("VK callback denied by allowlist: peer_id=%s", peer_id)
+            await ctx.answer("Not authorized")
             return
 
-        kind = str(payload.get("h") or "")
-        if kind == "ea":
-            await self._approval(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "sc":
-            await self._slash_confirm(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "cl":
-            await self._clarify(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mp":
-            await self._model_provider_page(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mpc":
-            await self._model_provider(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mmp":
-            await self._model_model_page(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mb":
-            await self._model_back(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mm":
-            await self._model_model(payload, event_id, user_id, peer_id, cmid)
-        elif kind == "mc":
-            await self._model_close(event_id, user_id, peer_id, cmid)
+        handler = {
+            "ea": self._approval,
+            "sc": self._slash_confirm,
+            "cl": self._clarify,
+            "mp": self._model_provider_page,
+            "mpc": self._model_provider,
+            "mmp": self._model_model_page,
+            "mb": self._model_back,
+            "mm": self._model_model,
+            "mc": self._model_close,
+        }.get(str(payload.get("h") or ""))
+        if handler is None:
+            logger.debug("VK callback ignored: unknown kind")
+            await ctx.answer("Unsupported action")
+            return
+        await handler(payload, ctx)
 
-    async def _approval(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        approval_id = _safe_int(payload.get("id"), 0)
+    # -- approvals ---------------------------------------------------------
+
+    async def _approval(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
         choice = str(payload.get("c") or "")
-        if choice not in {"once", "session", "always", "deny"}:
-            await self._answer(event_id, user_id, peer_id, "Invalid approval")
+        if choice not in APPROVAL_CHOICES:
+            await ctx.answer("Invalid approval")
             return
-        session_key = self.approval_state.pop(approval_id, None)
-        if not session_key:
-            await self._answer(event_id, user_id, peer_id, "Already resolved")
+        action = await ctx.authorize("ea", payload.get("id"))
+        if action is None:
             return
+
         try:
             from tools.approval import resolve_gateway_approval
 
-            resolve_gateway_approval(session_key, choice)
-            await self._answer(event_id, user_id, peer_id, f"Resolved: {choice}")
-            await self._edit(peer_id, cmid, f"Approval resolved: {choice}")
+            resolve_gateway_approval(action.session_key, choice)
         except Exception as exc:
-            logger.warning("VK approval callback failed: %s", exc)
-            await self._answer(event_id, user_id, peer_id, "Approval failed")
+            # State intentionally survives: the button stays usable until it
+            # expires instead of the prompt becoming unanswerable.
+            logger.warning("VK approval resolution failed: %s", type(exc).__name__)
+            await ctx.answer("Approval failed, try again")
+            return
 
-    async def _slash_confirm(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        confirm_id = str(payload.get("id") or "")
+        self.store.discard("ea", action.action_id)
+        await ctx.answer(f"Resolved: {choice}")
+        await ctx.edit(f"Approval resolved: {choice}")
+
+    async def _slash_confirm(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
         choice = str(payload.get("c") or "")
-        if choice not in {"once", "always", "cancel"}:
-            await self._answer(event_id, user_id, peer_id, "Invalid choice")
+        if choice not in SLASH_CONFIRM_CHOICES:
+            await ctx.answer("Invalid choice")
             return
-        session_key = self.slash_confirm_state.pop(confirm_id, None)
-        if not session_key:
-            await self._answer(event_id, user_id, peer_id, "Already resolved")
+        action = await ctx.authorize("sc", payload.get("id"))
+        if action is None:
             return
+
         try:
             from tools import slash_confirm
 
-            result_text = await slash_confirm.resolve(session_key, confirm_id, choice)
-            await self._answer(event_id, user_id, peer_id, f"Resolved: {choice}")
-            await self._edit(peer_id, cmid, f"Confirmation resolved: {choice}")
-            if result_text:
-                await self.client.send_message(
-                    peer_id=peer_id,
-                    message=render_vk_plain_text(str(result_text)),
-                    keyboard=(
-                        self.keyboards.command_keyboard()
-                        if self.command_keyboard_enabled
-                        else None
-                    ),
-                )
+            result_text = await slash_confirm.resolve(action.session_key, action.action_id, choice)
         except Exception as exc:
-            logger.warning("VK slash-confirm callback failed: %s", exc)
-            await self._answer(event_id, user_id, peer_id, "Confirmation failed")
-
-    async def _clarify(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        clarify_id = str(payload.get("id") or "")
-        choice = payload.get("c")
-        if clarify_id not in self.clarify_state:
-            await self._answer(event_id, user_id, peer_id, "Already resolved")
+            logger.warning("VK slash-confirm resolution failed: %s", type(exc).__name__)
+            await ctx.answer("Confirmation failed, try again")
             return
+
+        self.store.discard("sc", action.action_id)
+        await ctx.answer(f"Resolved: {choice}")
+        await ctx.edit(f"Confirmation resolved: {choice}")
+        if result_text:
+            await self.client.send_message(
+                peer_id=ctx.peer_id,
+                message=render_vk_plain_text(str(result_text)),
+                keyboard=(
+                    self.keyboards.command_keyboard() if self.command_keyboard_enabled else None
+                ),
+            )
+
+    async def _clarify(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await ctx.authorize("cl", payload.get("id"))
+        if action is None:
+            return
+        choice = payload.get("c")
+
         if choice == "other":
             try:
                 from tools.clarify_gateway import mark_awaiting_text
 
-                mark_awaiting_text(clarify_id)
+                mark_awaiting_text(action.action_id)
             except Exception as exc:
-                logger.warning("VK clarify mark_awaiting_text failed: %s", exc)
-            await self._answer(event_id, user_id, peer_id, "Type your answer")
-            await self._edit(peer_id, cmid, "Clarify prompt: awaiting typed response")
+                logger.warning("VK clarify mark_awaiting_text failed: %s", type(exc).__name__)
+            # Not a terminal resolution: the typed answer still has to arrive.
+            await ctx.answer("Type your answer")
+            await ctx.edit("Clarify prompt: awaiting typed response")
             return
 
-        idx = _safe_int(choice, -1)
-        resolved_text = f"choice {idx + 1}"
-        try:
-            from tools.clarify_gateway import _entries as clarify_entries  # type: ignore
+        # Choices are recorded when the prompt is sent, so resolving one never
+        # requires reaching into Hermes' private clarify state.
+        choices = action.data.get("choices") or []
+        index = _safe_int(choice, -1)
+        if not 0 <= index < len(choices):
+            await ctx.answer("Unknown choice")
+            return
+        resolved_text = str(choices[index])
 
-            entry = clarify_entries.get(clarify_id)
-            choices = getattr(entry, "choices", None)
-            if choices and 0 <= idx < len(choices):
-                resolved_text = str(choices[idx])
-        except Exception:
-            pass
-
-        self.clarify_state.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
 
-            resolve_gateway_clarify(clarify_id, resolved_text)
-            await self._answer(event_id, user_id, peer_id, resolved_text[:90])
-            await self._edit(peer_id, cmid, f"Clarify answered: {resolved_text}")
+            resolve_gateway_clarify(action.action_id, resolved_text)
         except Exception as exc:
-            logger.warning("VK clarify callback failed: %s", exc)
-            await self._answer(event_id, user_id, peer_id, "Clarify failed")
+            logger.warning("VK clarify resolution failed: %s", type(exc).__name__)
+            await ctx.answer("Clarify failed, try again")
+            return
 
-    async def _model_provider_page(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        state = self.model_picker_state.get(str(peer_id))
-        if not state:
-            await self._answer(event_id, user_id, peer_id, "Picker expired")
+        self.store.discard("cl", action.action_id)
+        await ctx.answer(resolved_text[:90])
+        await ctx.edit(f"Clarify answered: {resolved_text}")
+
+    # -- model picker ------------------------------------------------------
+
+    async def _picker(self, payload: dict[str, Any], ctx: _CallbackContext):
+        return await ctx.authorize(PICKER_KIND, payload.get("i"), rejection="Picker expired")
+
+    async def _model_provider_page(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
             return
         page = _safe_int(payload.get("pg"), 0)
-        state["provider_page"] = page
-        providers = state.get("providers") or []
-        await self._edit(
-            peer_id,
-            cmid,
-            model_picker_provider_text(
-                providers,
-                str(state.get("current_model") or ""),
-                str(state.get("current_provider") or ""),
-                page,
-            ),
-            keyboard=self.keyboards.provider_keyboard(providers, page),
-        )
+        action.data["provider_page"] = page
+        await self._render_providers(action, ctx, page)
 
-    async def _model_provider(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        state = self.model_picker_state.get(str(peer_id))
-        if not state:
-            await self._answer(event_id, user_id, peer_id, "Picker expired")
+    async def _model_back(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
             return
-        provider_index = _safe_int(payload.get("p"), -1)
-        providers = state.get("providers") or []
-        if not (0 <= provider_index < len(providers)):
-            await self._answer(event_id, user_id, peer_id, "Unknown provider")
-            return
-        state["provider_page"] = _safe_int(payload.get("pg"), state.get("provider_page", 0))
-        state["selected_provider_index"] = provider_index
-        state["model_page"] = 0
-        provider = providers[provider_index]
-        await self._edit(
-            peer_id,
-            cmid,
-            model_picker_model_text(provider, 0),
-            keyboard=self.keyboards.model_keyboard(provider, provider_index, 0),
-        )
+        page = _safe_int(payload.get("pg"), action.data.get("provider_page", 0))
+        action.data["provider_page"] = page
+        await self._render_providers(action, ctx, page)
 
-    async def _model_model_page(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        state = self.model_picker_state.get(str(peer_id))
-        if not state:
-            await self._answer(event_id, user_id, peer_id, "Picker expired")
+    async def _model_provider(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
             return
+        providers = action.data.get("providers") or []
         provider_index = _safe_int(payload.get("p"), -1)
+        if not 0 <= provider_index < len(providers):
+            await ctx.answer("Unknown provider")
+            return
+        action.data["provider_page"] = _safe_int(
+            payload.get("pg"), action.data.get("provider_page", 0)
+        )
+        action.data["selected_provider_index"] = provider_index
+        action.data["model_page"] = 0
+        await self._render_models(action, ctx, providers[provider_index], provider_index, 0)
+
+    async def _model_model_page(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
+            return
+        providers = action.data.get("providers") or []
+        provider_index = _safe_int(payload.get("p"), -1)
+        if not 0 <= provider_index < len(providers):
+            await ctx.answer("Unknown provider")
+            return
         page = _safe_int(payload.get("pg"), 0)
-        providers = state.get("providers") or []
-        if not (0 <= provider_index < len(providers)):
-            await self._answer(event_id, user_id, peer_id, "Unknown provider")
-            return
-        state["selected_provider_index"] = provider_index
-        state["model_page"] = page
-        provider = providers[provider_index]
-        await self._edit(
-            peer_id,
-            cmid,
-            model_picker_model_text(provider, page),
-            keyboard=self.keyboards.model_keyboard(provider, provider_index, page),
-        )
+        action.data["selected_provider_index"] = provider_index
+        action.data["model_page"] = page
+        await self._render_models(action, ctx, providers[provider_index], provider_index, page)
 
-    async def _model_back(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        state = self.model_picker_state.get(str(peer_id))
-        if not state:
-            await self._answer(event_id, user_id, peer_id, "Picker expired")
+    async def _model_model(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
             return
-        page = _safe_int(payload.get("pg"), state.get("provider_page", 0))
-        state["provider_page"] = page
-        providers = state.get("providers") or []
-        await self._edit(
-            peer_id,
-            cmid,
-            model_picker_provider_text(
-                providers,
-                str(state.get("current_model") or ""),
-                str(state.get("current_provider") or ""),
-                page,
-            ),
-            keyboard=self.keyboards.provider_keyboard(providers, page),
-        )
-
-    async def _model_model(
-        self,
-        payload: dict[str, Any],
-        event_id: str,
-        user_id: int,
-        peer_id: int,
-        cmid: int,
-    ) -> None:
-        state = self.model_picker_state.get(str(peer_id))
-        if not state:
-            await self._answer(event_id, user_id, peer_id, "Picker expired")
-            return
+        providers = action.data.get("providers") or []
         provider_index = _safe_int(payload.get("p"), -1)
-        model_index = _safe_int(payload.get("m"), -1)
-        providers = state.get("providers") or []
-        if not (0 <= provider_index < len(providers)):
-            await self._answer(event_id, user_id, peer_id, "Unknown provider")
+        if not 0 <= provider_index < len(providers):
+            await ctx.answer("Unknown provider")
             return
         provider = providers[provider_index]
         models = provider.get("models") or []
-        if not (0 <= model_index < len(models)):
-            await self._answer(event_id, user_id, peer_id, "Unknown model")
+        model_index = _safe_int(payload.get("m"), -1)
+        if not 0 <= model_index < len(models):
+            await ctx.answer("Unknown model")
             return
+
         model_id = str(models[model_index])
         provider_slug = str(provider.get("slug") or provider.get("id") or "")
-        callback = state.get("on_model_selected")
+        callback = action.data.get("on_model_selected")
         try:
-            result_text = await callback(str(peer_id), model_id, provider_slug)
-            await self._edit(peer_id, cmid, render_vk_plain_text(str(result_text)))
+            result_text = await callback(str(ctx.peer_id), model_id, provider_slug)
         except Exception as exc:
-            logger.warning("VK model picker callback failed: %s", exc)
-            await self._answer(event_id, user_id, peer_id, "Model switch failed")
-
-    async def _model_close(self, event_id: str, user_id: int, peer_id: int, cmid: int) -> None:
-        self.model_picker_state.pop(str(peer_id), None)
-        await self._edit(peer_id, cmid, "Model picker closed.", keyboard=None)
-
-    async def _answer(self, event_id: str, user_id: int, peer_id: int, text: str) -> None:
-        if not event_id:
+            logger.warning("VK model switch failed: %s", type(exc).__name__)
+            await ctx.answer("Model switch failed")
             return
+
+        self.store.discard(PICKER_KIND, action.action_id)
+        await ctx.edit(render_vk_plain_text(str(result_text)))
+
+    async def _model_close(self, payload: dict[str, Any], ctx: _CallbackContext) -> None:
+        action = await self._picker(payload, ctx)
+        if action is None:
+            return
+        self.store.discard(PICKER_KIND, action.action_id)
+        await ctx.edit("Model picker closed.", keyboard=None)
+
+    async def _render_providers(
+        self, action: PendingAction, ctx: _CallbackContext, page: int
+    ) -> None:
+        providers = action.data.get("providers") or []
+        await ctx.edit(
+            model_picker_provider_text(
+                providers,
+                str(action.data.get("current_model") or ""),
+                str(action.data.get("current_provider") or ""),
+                page,
+            ),
+            keyboard=self.keyboards.provider_keyboard(providers, action.action_id, page),
+        )
+
+    async def _render_models(
+        self,
+        action: PendingAction,
+        ctx: _CallbackContext,
+        provider: dict[str, Any],
+        provider_index: int,
+        page: int,
+    ) -> None:
+        await ctx.edit(
+            model_picker_model_text(provider, page),
+            keyboard=self.keyboards.model_keyboard(
+                provider, action.action_id, provider_index, page
+            ),
+        )
+
+
+class _CallbackContext:
+    """One inbound VK callback: answered at most once, edits its own message."""
+
+    def __init__(
+        self,
+        router: VKCallbackRouter,
+        event_id: str,
+        user_id: int,
+        peer_id: int,
+        cmid: int,
+    ) -> None:
+        self._router = router
+        self.event_id = event_id
+        self.user_id = user_id
+        self.peer_id = peer_id
+        self.cmid = cmid
+        self._answered = False
+
+    async def authorize(
+        self, kind: str, action_id: Any, *, rejection: str | None = None
+    ) -> PendingAction | None:
+        action, reason = self._router.store.authorize(
+            kind=kind, action_id=action_id, user_id=self.user_id, peer_id=self.peer_id
+        )
+        if action is not None:
+            return action
+        # Reason codes only: never log the session key or the prompt body.
+        logger.info(
+            "VK callback rejected: kind=%s reason=%s peer_id=%s", kind, reason, self.peer_id
+        )
+        await self.answer(rejection or _REJECTION_TEXT.get(reason, "Unavailable"))
+        return None
+
+    async def answer(self, text: str) -> None:
+        if self._answered or not self.event_id:
+            return
+        self._answered = True
         try:
-            await self.client.send_message_event_answer(
-                event_id=event_id,
-                user_id=user_id,
-                peer_id=peer_id,
+            await self._router.client.send_message_event_answer(
+                event_id=self.event_id,
+                user_id=self.user_id,
+                peer_id=self.peer_id,
                 text=text,
             )
         except Exception as exc:
-            logger.debug("VK callback answer failed: %s", exc)
+            logger.debug("VK callback answer failed: %s", type(exc).__name__)
 
-    async def _edit(
-        self,
-        peer_id: int,
-        cmid: int,
-        message: str,
-        keyboard: str | None = None,
-    ) -> None:
-        if not cmid:
+    async def edit(self, message: str, keyboard: str | None = None) -> None:
+        if not self.cmid:
             return
         try:
-            await self.client.edit_message(
-                peer_id=peer_id,
-                cmid=cmid,
+            await self._router.client.edit_message(
+                peer_id=self.peer_id,
+                cmid=self.cmid,
                 message=message,
                 keyboard=keyboard,
             )
         except Exception as exc:
-            logger.debug("VK callback edit failed: %s", exc)
-
-
-def decode_payload(payload: Any) -> dict[str, Any]:
-    if isinstance(payload, dict):
-        return payload
-    if isinstance(payload, str) and payload.strip():
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError:
-            return {}
-        return decoded if isinstance(decoded, dict) else {}
-    return {}
+            logger.debug("VK callback edit failed: %s", type(exc).__name__)

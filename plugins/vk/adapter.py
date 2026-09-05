@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import random
+import secrets
 import time
 from typing import Any
 
@@ -27,7 +28,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
 )
 
-from .callbacks import VKCallbackRouter
+from .callbacks import PICKER_KIND, VKCallbackRouter
 from .client import (
     VK_MESSAGE_PHOTO_MIME_TYPES,
     LongPollState,
@@ -37,12 +38,16 @@ from .client import (
     is_retryable,
 )
 from .formatting import chunk_vk_text, render_vk_plain_text
+from .interactive import InteractiveStore
 from .keyboards import VKKeyboardFactory, model_picker_provider_text
 from .state import BoundedTTLCache
 from .utils import (
     DEFAULT_API_VERSION,
     DEFAULT_MAX_MESSAGE_LENGTH,
     DEFAULT_POLL_WAIT_SECONDS,
+    GROUP_PEER_ID_BASE,
+    LAST_ACTOR_MAX_ENTRIES,
+    LAST_ACTOR_TTL_SECONDS,
     OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
     OUTBOUND_IDEMPOTENCY_TTL_SECONDS,
     SEEN_EVENT_MAX_ENTRIES,
@@ -104,10 +109,14 @@ class VKAdapter(BasePlatformAdapter):
         self.poll_task: asyncio.Task | None = None
         self.longpoll_state: LongPollState | None = None
         self._approval_counter = 0
-        self._approval_state: dict[int, str] = {}
-        self._slash_confirm_state: dict[str, str] = {}
-        self._clarify_state: dict[str, str] = {}
-        self._model_picker_state: dict[str, dict[str, Any]] = {}
+        # One bounded, expiring, actor-bound store for every interactive prompt.
+        self._interactive = InteractiveStore()
+        # Who last spoke in each peer. Hermes' interactive hooks pass a chat_id
+        # but no user_id, and in a group chat the peer alone cannot say who the
+        # prompt is for -- see _actor_for_peer.
+        self._last_actor = BoundedTTLCache(
+            max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
+        )
         self._keyboards = VKKeyboardFactory()
         self._outbound_random_ids = BoundedTTLCache(
             max_entries=OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
@@ -518,7 +527,7 @@ class VKAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         peer_id = _safe_int(chat_id)
-        chat_type = "group" if peer_id >= 2_000_000_000 else "dm"
+        chat_type = "group" if peer_id >= GROUP_PEER_ID_BASE else "dm"
         return {
             "id": chat_id,
             "chat_id": chat_id,
@@ -762,7 +771,7 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(message.get("peer_id"), 0)
         from_id = _safe_int(message.get("from_id"), 0)
         text = str(message.get("text") or "").strip()
-        chat_type = "group" if peer_id >= 2_000_000_000 else "dm"
+        chat_type = "group" if peer_id >= GROUP_PEER_ID_BASE else "dm"
         msg_id_value = (
             message.get("conversation_message_id")
             if chat_type == "group"
@@ -783,6 +792,10 @@ class VKAdapter(BasePlatformAdapter):
             and not self._is_group_activation(text, message)
         ):
             return
+
+        # Remember who spoke: an interactive prompt raised during this turn is
+        # bound to them (Hermes' hooks pass no user_id).
+        self._last_actor.set(peer_id, from_id)
 
         media_paths, media_types, inferred_type = await self._extract_media(message)
         if text.startswith("/"):
@@ -820,19 +833,9 @@ class VKAdapter(BasePlatformAdapter):
             is_allowed_user=self._is_allowed_vk_user,
             keyboards=self._keyboard_factory(),
             command_keyboard_enabled=getattr(self, "command_keyboard_enabled", True),
-            approval_state=self._state_dict("_approval_state"),
-            slash_confirm_state=self._state_dict("_slash_confirm_state"),
-            clarify_state=self._state_dict("_clarify_state"),
-            model_picker_state=self._state_dict("_model_picker_state"),
+            store=self._interactive,
         )
         await router.handle(event)
-
-    def _state_dict(self, name: str) -> dict:
-        state = getattr(self, name, None)
-        if state is None:
-            state = {}
-            setattr(self, name, state)
-        return state
 
     async def _extract_media(
         self, message: dict[str, Any]
@@ -935,6 +938,24 @@ class VKAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         return render_vk_plain_text(content)
 
+    def _actor_for_peer(self, peer_id: int) -> int:
+        """The VK user an interactive prompt in this peer belongs to.
+
+        Hermes' interactive hooks pass a chat_id and a session key but no
+        user_id, so the actor has to be recovered here:
+
+        * in a DM the peer *is* the user, which is exact;
+        * in a group chat, the prompt is always a response to the turn we just
+          handled, so the last inbound sender in that peer is the right actor.
+
+        If neither is known the prompt is registered with user 0, which the
+        store treats as peer-bound only. That is weaker than actor-bound, but
+        refusing to render the prompt at all would strand the turn.
+        """
+        if 0 < peer_id < GROUP_PEER_ID_BASE:
+            return peer_id
+        return _safe_int(self._last_actor.get(peer_id), 0)
+
     def _keyboard_factory(self) -> VKKeyboardFactory:
         factory = getattr(self, "_keyboards", None)
         if factory is None:
@@ -954,11 +975,17 @@ class VKAdapter(BasePlatformAdapter):
     def _clarify_keyboard(self, choices: list, clarify_id: str) -> str:
         return self._keyboard_factory().clarify_keyboard(choices, clarify_id)
 
-    def _provider_keyboard(self, providers: list, page: int = 0) -> str:
-        return self._keyboard_factory().provider_keyboard(providers, page)
+    def _provider_keyboard(self, providers: list, action_id: str, page: int = 0) -> str:
+        return self._keyboard_factory().provider_keyboard(providers, action_id, page)
 
-    def _model_keyboard(self, provider: dict[str, Any], provider_index: int, page: int = 0) -> str:
-        return self._keyboard_factory().model_keyboard(provider, provider_index, page)
+    def _model_keyboard(
+        self,
+        provider: dict[str, Any],
+        action_id: str,
+        provider_index: int,
+        page: int = 0,
+    ) -> str:
+        return self._keyboard_factory().model_keyboard(provider, action_id, provider_index, page)
 
     def _send_limit(self) -> int:
         """Per-chunk character budget, never above what VK will accept."""
@@ -1012,7 +1039,13 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         self._approval_counter += 1
         approval_id = self._approval_counter
-        self._approval_state[approval_id] = session_key
+        self._interactive.register(
+            kind="ea",
+            action_id=approval_id,
+            user_id=self._actor_for_peer(peer_id),
+            peer_id=peer_id,
+            session_key=session_key,
+        )
         preview = command[:1800] + "..." if len(command) > 1800 else command
         text = f"Command approval required\n\n{preview}\n\nReason: {description}"
         try:
@@ -1023,7 +1056,7 @@ class VKAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
-            self._approval_state.pop(approval_id, None)
+            self._interactive.discard("ea", approval_id)
             return self._failed_send(exc)
 
     async def send_slash_confirm(
@@ -1040,7 +1073,13 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
-        self._slash_confirm_state[confirm_id] = session_key
+        self._interactive.register(
+            kind="sc",
+            action_id=confirm_id,
+            user_id=self._actor_for_peer(peer_id),
+            peer_id=peer_id,
+            session_key=session_key,
+        )
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
@@ -1049,7 +1088,7 @@ class VKAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
-            self._slash_confirm_state.pop(confirm_id, None)
+            self._interactive.discard("sc", confirm_id)
             return self._failed_send(exc)
 
     async def send_clarify(
@@ -1083,7 +1122,16 @@ class VKAdapter(BasePlatformAdapter):
                 mark_awaiting_text(clarify_id)
             except Exception:
                 pass
-        self._clarify_state[clarify_id] = session_key
+        # The choices are recorded here so resolving a tap never has to read
+        # Hermes' private clarify_gateway state.
+        self._interactive.register(
+            kind="cl",
+            action_id=clarify_id,
+            user_id=self._actor_for_peer(peer_id),
+            peer_id=peer_id,
+            session_key=session_key,
+            data={"choices": clean_choices[:8]},
+        )
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
@@ -1092,7 +1140,7 @@ class VKAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
-            self._clarify_state.pop(clarify_id, None)
+            self._interactive.discard("cl", clarify_id)
             return self._failed_send(exc)
 
     async def send_model_picker(
@@ -1110,23 +1158,30 @@ class VKAdapter(BasePlatformAdapter):
         peer_id = _safe_int(chat_id)
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
-        self._model_picker_state[str(peer_id)] = {
-            "providers": providers,
-            "session_key": session_key,
-            "on_model_selected": on_model_selected,
-            "current_model": current_model,
-            "current_provider": current_provider,
-            "provider_page": 0,
-        }
+        picker_id = secrets.token_hex(4)
+        self._interactive.register(
+            kind=PICKER_KIND,
+            action_id=picker_id,
+            user_id=self._actor_for_peer(peer_id),
+            peer_id=peer_id,
+            session_key=session_key,
+            data={
+                "providers": providers,
+                "on_model_selected": on_model_selected,
+                "current_model": current_model,
+                "current_provider": current_provider,
+                "provider_page": 0,
+            },
+        )
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
                 message=model_picker_provider_text(providers, current_model, current_provider),
-                keyboard=self._provider_keyboard(providers),
+                keyboard=self._provider_keyboard(providers, picker_id),
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
-            self._model_picker_state.pop(str(peer_id), None)
+            self._interactive.discard(PICKER_KIND, picker_id)
             return self._failed_send(exc)
 
 

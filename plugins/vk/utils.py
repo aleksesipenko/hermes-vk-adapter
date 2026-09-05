@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -116,3 +117,37 @@ def update_dedupe_key(update: dict[str, Any]) -> tuple[Any, ...] | None:
 
 # VK accepts at most this many attachments on one messages.send call.
 VK_MAX_ATTACHMENTS = 10
+
+
+# VK caps a callback button payload; anything larger is not something we sent.
+VK_CALLBACK_PAYLOAD_MAX_CHARS = 255
+
+
+def decode_callback_payload(payload: Any) -> dict[str, Any]:
+    """Decode a VK callback payload into a dict, rejecting anything odd.
+
+    Callback payloads are attacker-influenced input: they arrive as whatever
+    the VK client sends. Only a JSON object within VK's documented size cap is
+    accepted; everything else decodes to an empty dict and is refused upstream.
+    """
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, str) or not payload.strip():
+        return {}
+    if len(payload) > VK_CALLBACK_PAYLOAD_MAX_CHARS:
+        return {}
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+# Who last spoke in a peer, so an interactive prompt can be bound to them.
+LAST_ACTOR_MAX_ENTRIES = 256
+LAST_ACTOR_TTL_SECONDS = 3600.0
+
+
+# VK numbers group conversations from this offset; anything below is a DM,
+# where peer_id and the user's id are the same number.
+GROUP_PEER_ID_BASE = 2_000_000_000

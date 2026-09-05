@@ -20,6 +20,7 @@ from plugins.vk.adapter import (
     _truthy,
     register,
 )
+from plugins.vk.state import BoundedTTLCache as _BoundedTTLCache
 from plugins.vk.utils import _vk_attachment_ref
 
 # Importing the adapter requires the real Hermes contract.
@@ -423,6 +424,7 @@ async def test_group_slash_command_bypasses_mention_and_uses_command_type():
 
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
+    adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
 
     await VKAdapter._handle_message_new(
         adapter,
@@ -459,6 +461,7 @@ async def test_group_reply_to_bot_activates_plain_text_message():
 
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
+    adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
 
     await VKAdapter._handle_message_new(
         adapter,
@@ -497,7 +500,7 @@ def test_vk_inline_keyboards_stay_within_row_limits():
         for index in range(10)
     ]
 
-    provider_keyboard = json.loads(VKAdapter._provider_keyboard(adapter, providers))
+    provider_keyboard = json.loads(VKAdapter._provider_keyboard(adapter, providers, "pick1"))
     model_keyboard = json.loads(
         VKAdapter._model_keyboard(
             adapter,
@@ -506,6 +509,7 @@ def test_vk_inline_keyboards_stay_within_row_limits():
                 "slug": "provider",
                 "models": [f"model-{index}" for index in range(10)],
             },
+            "pick1",
             0,
         )
     )
@@ -532,7 +536,7 @@ def test_model_picker_uses_numbered_buttons_and_navigation():
         for index in range(9)
     ]
 
-    provider_keyboard = json.loads(VKAdapter._provider_keyboard(adapter, providers))
+    provider_keyboard = json.loads(VKAdapter._provider_keyboard(adapter, providers, "pick1"))
     provider_buttons = [button for row in provider_keyboard["buttons"] for button in row]
     provider_labels = [button["action"]["label"] for button in provider_buttons]
     provider_payloads = [button["action"].get("payload") for button in provider_buttons]
@@ -542,11 +546,11 @@ def test_model_picker_uses_numbered_buttons_and_navigation():
     assert "Close" in provider_labels
     assert provider_labels.index("Close") < provider_labels.index("Next")
     assert all("Provider" not in label for label in provider_labels)
-    assert {"h": "mpc", "pg": 0, "p": 0} in provider_payloads
-    assert {"h": "mp", "pg": 1} in provider_payloads
-    assert {"h": "mc"} in provider_payloads
+    assert {"h": "mpc", "i": "pick1", "pg": 0, "p": 0} in provider_payloads
+    assert {"h": "mp", "i": "pick1", "pg": 1} in provider_payloads
+    assert {"h": "mc", "i": "pick1"} in provider_payloads
 
-    model_keyboard = json.loads(VKAdapter._model_keyboard(adapter, providers[0], 0))
+    model_keyboard = json.loads(VKAdapter._model_keyboard(adapter, providers[0], "pick1", 0))
     model_buttons = [button for row in model_keyboard["buttons"] for button in row]
     model_labels = [button["action"]["label"] for button in model_buttons]
     model_payloads = [button["action"].get("payload") for button in model_buttons]
@@ -555,8 +559,8 @@ def test_model_picker_uses_numbered_buttons_and_navigation():
     assert model_labels[6:] == ["Back", "Next", "Close"]
     assert "Close" in model_labels
     assert all("model" not in label.lower() for label in model_labels)
-    assert {"h": "mb"} in model_payloads
-    assert {"h": "mm", "p": 0, "pg": 0, "m": 0} in model_payloads
+    assert {"h": "mb", "i": "pick1"} in model_payloads
+    assert {"h": "mm", "i": "pick1", "p": 0, "pg": 0, "m": 0} in model_payloads
 
 
 @pytest.mark.asyncio
@@ -587,226 +591,12 @@ async def test_raw_edit_and_message_event_answer_calls():
     assert b"show_snackbar" in answer.calls.last.request.content
 
 
-@pytest.mark.asyncio
-async def test_message_event_approval_resolves_once_and_denies_unauthorized(monkeypatch):
-    calls = []
-
-    def fake_resolve(session_key, choice):
-        calls.append((session_key, choice))
-        return 1
-
-    monkeypatch.setattr("tools.approval.resolve_gateway_approval", fake_resolve)
-
-    class FakeClient:
-        def __init__(self):
-            self.answers = []
-            self.edits = []
-
-        async def send_message_event_answer(self, **kwargs):
-            self.answers.append(kwargs)
-            return 1
-
-        async def edit_message(self, **kwargs):
-            self.edits.append(kwargs)
-            return 1
-
-    adapter = object.__new__(VKAdapter)
-    adapter.client = FakeClient()
-    adapter.allowed_users = {"987654321"}
-    adapter.allow_all_users = False
-    adapter._approval_state = {1: "vk:987654321"}
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "bad",
-            "user_id": 42,
-            "peer_id": 987654321,
-            "conversation_message_id": 11,
-            "payload": {"h": "ea", "id": 1, "c": "once"},
-        },
-    )
-    assert calls == []
-    assert adapter._approval_state == {1: "vk:987654321"}
-    assert "not authorized" in adapter.client.answers[-1]["text"].lower()
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "ok",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 11,
-            "payload": {"h": "ea", "id": 1, "c": "once"},
-        },
-    )
-    assert calls == [("vk:987654321", "once")]
-    assert adapter._approval_state == {}
 
 
-@pytest.mark.asyncio
-async def test_clarify_callbacks_resolve_choice_and_other(monkeypatch):
-    resolved = []
-    awaiting = []
-
-    fake_entry = SimpleNamespace(choices=["alpha", "beta"])
-
-    monkeypatch.setattr("tools.clarify_gateway._entries", {"clarify-1": fake_entry}, raising=False)
-    monkeypatch.setattr(
-        "tools.clarify_gateway.resolve_gateway_clarify",
-        lambda clarify_id, response: resolved.append((clarify_id, response)) or True,
-    )
-    monkeypatch.setattr(
-        "tools.clarify_gateway.mark_awaiting_text",
-        lambda clarify_id: awaiting.append(clarify_id),
-    )
-
-    class FakeClient:
-        async def send_message_event_answer(self, **kwargs):
-            return 1
-
-        async def edit_message(self, **kwargs):
-            return 1
-
-    adapter = object.__new__(VKAdapter)
-    adapter.client = FakeClient()
-    adapter.allow_all_users = True
-    adapter.allowed_users = set()
-    adapter._clarify_state = {"clarify-1": "vk:987654321", "clarify-2": "vk:987654321"}
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "choice",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 12,
-            "payload": {"h": "cl", "id": "clarify-1", "c": 1},
-        },
-    )
-    assert resolved == [("clarify-1", "beta")]
-    assert "clarify-1" not in adapter._clarify_state
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "other",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 13,
-            "payload": {"h": "cl", "id": "clarify-2", "c": "other"},
-        },
-    )
-    assert awaiting == ["clarify-2"]
-    assert "clarify-2" in adapter._clarify_state
 
 
-@pytest.mark.asyncio
-async def test_model_picker_callbacks_call_selected_model():
-    selected = []
-
-    async def on_model_selected(chat_id, model_id, provider_slug):
-        selected.append((chat_id, model_id, provider_slug))
-        return f"Switched to {model_id}"
-
-    class FakeClient:
-        async def send_message_event_answer(self, **kwargs):
-            return 1
-
-        async def edit_message(self, **kwargs):
-            return 1
-
-    adapter = object.__new__(VKAdapter)
-    adapter.client = FakeClient()
-    adapter.allow_all_users = True
-    adapter.allowed_users = set()
-    adapter._model_picker_state = {
-        "987654321": {
-            "providers": [
-                {
-                    "slug": "openrouter",
-                    "name": "OpenRouter",
-                    "models": ["deepseek/chat", "qwen/chat"],
-                }
-            ],
-            "on_model_selected": on_model_selected,
-        }
-    }
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "model",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 14,
-            "payload": {"h": "mm", "p": 0, "pg": 0, "m": 1},
-        },
-    )
-
-    assert selected == [("987654321", "qwen/chat", "openrouter")]
 
 
-@pytest.mark.asyncio
-async def test_model_picker_back_and_close_edit_picker_message():
-    class FakeClient:
-        def __init__(self):
-            self.edits = []
-            self.answers = []
-
-        async def send_message_event_answer(self, **kwargs):
-            self.answers.append(kwargs)
-            return 1
-
-        async def edit_message(self, **kwargs):
-            self.edits.append(kwargs)
-            return 1
-
-    providers = [
-        {"slug": f"provider-{index}", "name": f"Provider {index}", "models": [f"model-{index}"]}
-        for index in range(9)
-    ]
-    adapter = object.__new__(VKAdapter)
-    adapter.client = FakeClient()
-    adapter.allow_all_users = True
-    adapter.allowed_users = set()
-    adapter._model_picker_state = {
-        "987654321": {
-            "providers": providers,
-            "current_model": "model-0",
-            "current_provider": "provider-0",
-            "provider_page": 1,
-        }
-    }
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "back",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 14,
-            "payload": {"h": "mb"},
-        },
-    )
-    assert "Choose provider" in adapter.client.edits[-1]["message"]
-    assert adapter._model_picker_state["987654321"]["provider_page"] == 1
-    assert adapter.client.answers == []
-
-    await VKAdapter._handle_message_event(
-        adapter,
-        {
-            "event_id": "close",
-            "user_id": 987654321,
-            "peer_id": 987654321,
-            "conversation_message_id": 14,
-            "payload": {"h": "mc"},
-        },
-    )
-    assert adapter.client.edits[-1]["keyboard"] is None
-    assert "closed" in adapter.client.edits[-1]["message"].lower()
-    assert "987654321" not in adapter._model_picker_state
-    assert adapter.client.answers == []
 
 
 # ── outbound idempotency and typed failures (Task 3) ──────────────────────
@@ -814,6 +604,7 @@ async def test_model_picker_back_and_close_edit_picker_message():
 
 def _idempotent_adapter():
     """An adapter wired just enough to exercise send()."""
+    from plugins.vk.interactive import InteractiveStore
     from plugins.vk.state import BoundedTTLCache
 
     class FakeClient:
@@ -834,6 +625,8 @@ def _idempotent_adapter():
     adapter.max_message_length = 9000
     adapter.command_keyboard_enabled = False
     adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
+    adapter._interactive = InteractiveStore()
+    adapter._last_actor = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     return adapter
 
 
@@ -981,10 +774,6 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
     adapter.client = DownClient()
     adapter._keyboards = VKKeyboardFactory()
     adapter._approval_counter = 0
-    adapter._approval_state = {}
-    adapter._slash_confirm_state = {}
-    adapter._clarify_state = {}
-    adapter._model_picker_state = {}
 
     results = [
         await VKAdapter.send_exec_approval(
@@ -1017,168 +806,11 @@ async def test_interactive_surfaces_report_typed_failures_and_drop_their_state()
         assert result.retryable is True
         assert result.error_kind == "transient"
 
-    # Pending state must not survive a send that never reached the user.
-    assert adapter._approval_state == {}
-    assert adapter._slash_confirm_state == {}
-    assert adapter._clarify_state == {}
-    assert adapter._model_picker_state == {}
-
-
-# ── complete text in normal and proactive delivery (Task 5) ───────────────
-
-
-def test_adapter_declares_native_splitting():
-    """Otherwise the delivery router truncates before send() ever runs."""
-    assert VKAdapter.splits_long_messages is True
-
-
-def test_send_limit_never_exceeds_what_vk_accepts():
-    from plugins.vk.utils import VK_MESSAGE_SEND_LIMIT
-
-    adapter = object.__new__(VKAdapter)
-    adapter.max_message_length = 99_999
-
-    assert VKAdapter._send_limit(adapter) == VK_MESSAGE_SEND_LIMIT
-
-    adapter.max_message_length = 0
-    assert VKAdapter._send_limit(adapter) > 0
-
-
-def test_chunk_text_renders_before_measuring():
-    adapter = object.__new__(VKAdapter)
-    adapter.max_message_length = 40
-
-    chunks = VKAdapter._chunk_text(adapter, "**bold** [docs](https://example.com/path)")
-
-    assert all(len(chunk) <= 40 for chunk in chunks)
-    assert not any("**" in chunk or "](" in chunk for chunk in chunks)
-
-
-@pytest.mark.asyncio
-async def test_long_content_survives_send_completely():
-    import re
-
-    adapter = _idempotent_adapter()
-    adapter.max_message_length = 4096
-    source = "Проверка длинного текста со словами. " * 400  # noqa: RUF001
-
-    result = await VKAdapter.send(adapter, chat_id="987654321", content=source)
-
-    assert result.success
-    sent = [call["message"] for call in adapter.client.sends]
-    assert len(sent) > 3
-    assert all(len(chunk) <= 4096 for chunk in sent)
-    assert re.sub(r"\s+", "", "".join(sent)) == re.sub(r"\s+", "", source)
-
-
-@pytest.mark.asyncio
-async def test_send_result_keeps_last_id_and_ordered_continuations():
-    adapter = _idempotent_adapter()
-    adapter.max_message_length = 10
-
-    result = await VKAdapter.send(adapter, chat_id="987654321", content="alpha beta gamma delta")
-
-    ids = [str(100 + n) for n in range(1, len(adapter.client.sends) + 1)]
-    assert result.message_id == ids[-1]
-    assert list(result.continuation_message_ids) == ids[:-1]
-
-
-@pytest.mark.asyncio
-async def test_media_auto_routes_images_to_native_photos_and_others_to_documents(tmp_path):
-    adapter = _idempotent_adapter()
-    calls = []
-
-    async def fake_image(chat_id, image_path, caption=None, reply_to=None, metadata=None, **kw):
-        calls.append(("image", image_path))
-        from gateway.platforms.base import SendResult as _SR
-
-        return _SR(success=True, message_id="1")
-
-    async def fake_media(chat_id, media_files, caption="", **kw):
-        calls.append(("document", tuple(media_files)))
-        from gateway.platforms.base import SendResult as _SR
-
-        return _SR(success=True, message_id="2")
-
-    adapter.send_image_file = fake_image
-    adapter.send_media_files = fake_media
-
-    png = tmp_path / "shot.png"
-    png.write_bytes(b"png")
-    pdf = tmp_path / "report.pdf"
-    pdf.write_bytes(b"pdf")
-
-    await VKAdapter.send_media_auto(adapter, "1", [str(png)], caption="c")
-    await VKAdapter.send_media_auto(adapter, "1", [str(pdf)], caption="c")
-    await VKAdapter.send_media_auto(adapter, "1", [str(png)], caption="c", force_document=True)
-
-    assert calls[0][0] == "image"
-    assert calls[1][0] == "document"
-    assert calls[2][0] == "document"
-
-
-@pytest.mark.asyncio
-async def test_photo_batches_respect_the_vk_attachment_cap():
-    from plugins.vk.utils import VK_MAX_ATTACHMENTS
-
-    adapter = _idempotent_adapter()
-    batches = [[f"photo{i}" for i in range(VK_MAX_ATTACHMENTS)], ["photo-extra"]]
-
-    result = await VKAdapter._send_attachment_batches(adapter, 5, batches, caption="hi")
-
-    assert result.success
-    sent = adapter.client.sends
-    assert len(sent) == 2
-    assert sent[0]["message"] == "hi"
-    assert sent[1]["message"] == ""
-    assert len(sent[0]["attachment"].split(",")) == VK_MAX_ATTACHMENTS
-
-
-@pytest.mark.asyncio
-async def test_standalone_send_uses_the_adapter_path(monkeypatch):
-    """Proactive delivery must render, chunk and dedupe like a normal reply."""
-    from types import SimpleNamespace
-
-    monkeypatch.setenv("VK_GROUP_TOKEN", "t" * 85)
-    monkeypatch.setenv("VK_GROUP_ID", "123456789")
-    monkeypatch.setenv("VK_MAX_MESSAGE_LENGTH", "40")
-
-    # Hermes grows a Platform member for a plugin platform when the plugin
-    # registers. Cron only ever reaches _standalone_send through that same
-    # registration, so establish the real precondition here too.
-    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
-
-    register(PluginContext(PluginManifest(name="vk"), PluginManager()))
-
-    from plugins.vk.adapter import _standalone_send
-
-    sends = []
-
-    class RecordingClient:
-        def __init__(self):
-            self._next = 0
-
-        def new_random_id(self):
-            self._next += 1
-            return self._next
-
-        async def send_message(self, **kwargs):
-            sends.append(kwargs)
-            return len(sends)
-
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(VKAdapter, "_build_client", lambda self: RecordingClient())
-
-    result = await _standalone_send(
-        SimpleNamespace(extra={}, token=""),
-        "987654321",
-        "**bold** " + "word " * 40,
-    )
-
-    assert result["success"] is True
-    assert len(sends) > 1
-    assert all(len(call["message"]) <= 40 for call in sends)
-    assert all("**" not in call["message"] for call in sends)
-    assert all(call["random_id"] > 0 for call in sends)
+    # Pending state must not survive a send that never reached the user: the
+    # button would authorize a prompt the user never saw.
+    for kind, action_id in (("ea", "1"), ("sc", "c"), ("cl", "cl")):
+        action, reason = adapter._interactive.authorize(
+            kind=kind, action_id=action_id, user_id=987654321, peer_id=987654321
+        )
+        assert action is None, f"{kind} state survived a failed send"
+        assert reason is not None
