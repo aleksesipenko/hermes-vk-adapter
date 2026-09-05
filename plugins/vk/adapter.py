@@ -29,6 +29,7 @@ from gateway.platforms.base import (
 )
 
 from .callbacks import PICKER_KIND, VKCallbackRouter
+from .capabilities import ClientCapabilities
 from .client import (
     VK_MESSAGE_PHOTO_MIME_TYPES,
     LongPollState,
@@ -46,6 +47,8 @@ from .utils import (
     DEFAULT_MAX_MESSAGE_LENGTH,
     DEFAULT_POLL_WAIT_SECONDS,
     GROUP_PEER_ID_BASE,
+    IDENTITY_MAX_ENTRIES,
+    IDENTITY_TTL_SECONDS,
     LAST_ACTOR_MAX_ENTRIES,
     LAST_ACTOR_TTL_SECONDS,
     OUTBOUND_IDEMPOTENCY_MAX_ENTRIES,
@@ -126,6 +129,13 @@ class VKAdapter(BasePlatformAdapter):
         # conversation_message_id, never on the global message id.
         self._last_inbound_cmid = BoundedTTLCache(
             max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
+        )
+        # What each peer's client can render, and who the peers actually are.
+        self._capabilities = BoundedTTLCache(
+            max_entries=IDENTITY_MAX_ENTRIES, ttl_seconds=IDENTITY_TTL_SECONDS
+        )
+        self._identities = BoundedTTLCache(
+            max_entries=IDENTITY_MAX_ENTRIES, ttl_seconds=IDENTITY_TTL_SECONDS
         )
         self._keyboards = VKKeyboardFactory()
         self._outbound_random_ids = BoundedTTLCache(
@@ -403,6 +413,98 @@ class VKAdapter(BasePlatformAdapter):
                 **kwargs,
             )
 
+    # ── client capabilities ──────────────────────────────────────────────
+
+    def _remember_capabilities(self, peer_id: int, client_info: Any) -> None:
+        """Record what this peer's client can render.
+
+        An event without ``client_info`` says nothing new, so it must not
+        overwrite what a previous event established -- otherwise one such event
+        would silently downgrade a modern client to the text fallback.
+        """
+        if not isinstance(client_info, dict) or not peer_id:
+            return
+        self._capabilities.set(peer_id, ClientCapabilities.from_client_info(client_info))
+
+    def _peer_capabilities(self, peer_id: int) -> ClientCapabilities:
+        cached = self._capabilities.get(peer_id)
+        return cached if isinstance(cached, ClientCapabilities) else ClientCapabilities()
+
+    def _callbacks_supported(self, peer_id: int) -> bool:
+        return self._peer_capabilities(peer_id).supports_callback
+
+    def _approval_fallback_text(self) -> str:
+        """Instructions for a client that cannot render callback buttons."""
+        prefix = getattr(self, "typed_command_prefix", "/")
+        return (
+            f"Reply with {prefix}approve once, {prefix}approve session, "
+            f"{prefix}approve always, or {prefix}approve deny."
+        )
+
+    def _clarify_fallback_text(self, choices: list) -> str:
+        lines = [f"{index}. {choice}" for index, choice in enumerate(choices[:8], start=1)]
+        lines.append("Reply with the number of your choice, or type your own answer.")
+        return "\n".join(lines)
+
+    # ── identities ───────────────────────────────────────────────────────
+
+    async def _resolve_user_name(self, user_id: int) -> str:
+        """A VK user's display name, or a numeric label when unavailable.
+
+        Cached with a bounded TTL; a lookup failure returns the numeric label
+        *without* caching it, so a transient VK error does not pin a degraded
+        name for the whole TTL.
+        """
+        fallback = f"VK user {user_id}"
+        if not user_id or not self.client:
+            return fallback
+        cached = self._identities.get(("user", user_id))
+        if cached:
+            return cached
+        try:
+            users = await self.client.get_users([user_id])
+        except Exception as exc:
+            logger.debug("VK users.get failed for %s: %s", user_id, redact_secrets(exc))
+            return fallback
+        for user in users or []:
+            if not isinstance(user, dict):
+                continue
+            name = " ".join(
+                part
+                for part in (user.get("first_name"), user.get("last_name"))
+                if isinstance(part, str) and part.strip()
+            ).strip()
+            if name:
+                self._identities.set(("user", user_id), name)
+                return name
+        return fallback
+
+    async def _resolve_chat_name(self, peer_id: int) -> str:
+        """A conversation's title, or a numeric label when unavailable."""
+        if 0 < peer_id < GROUP_PEER_ID_BASE:
+            # A DM peer *is* the user: no second API surface needed.
+            return await self._resolve_user_name(peer_id)
+
+        fallback = f"VK peer {peer_id}"
+        if not peer_id or not self.client:
+            return fallback
+        cached = self._identities.get(("chat", peer_id))
+        if cached:
+            return cached
+        try:
+            conversation = await self.client.get_conversation(peer_id)
+        except Exception as exc:
+            logger.debug("VK conversation lookup failed for %s: %s", peer_id, redact_secrets(exc))
+            return fallback
+        for item in (conversation or {}).get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("chat_settings") or {}).get("title")
+            if isinstance(title, str) and title.strip():
+                self._identities.set(("chat", peer_id), title.strip())
+                return title.strip()
+        return fallback
+
     async def edit_message(
         self,
         chat_id: str,
@@ -644,7 +746,7 @@ class VKAdapter(BasePlatformAdapter):
         return {
             "id": chat_id,
             "chat_id": chat_id,
-            "name": f"VK peer {chat_id}",
+            "name": await self._resolve_chat_name(peer_id),
             "type": chat_type,
         }
 
@@ -912,6 +1014,7 @@ class VKAdapter(BasePlatformAdapter):
         # Only now -- after the allowlist accepted the sender. Acknowledging
         # earlier would confirm to a stranger that the bot is live and read
         # their message.
+        self._remember_capabilities(peer_id, message.get("client_info"))
         inbound_cmid = _safe_int(message.get("conversation_message_id"), 0)
         if inbound_cmid:
             self._last_inbound_cmid.set(peer_id, inbound_cmid)
@@ -928,10 +1031,10 @@ class VKAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=str(peer_id),
-            chat_name=f"VK peer {peer_id}",
+            chat_name=await self._resolve_chat_name(peer_id),
             chat_type=chat_type,
             user_id=str(from_id),
-            user_name=f"VK user {from_id}",
+            user_name=await self._resolve_user_name(from_id),
         )
         event = MessageEvent(
             text=text,
@@ -1169,11 +1272,16 @@ class VKAdapter(BasePlatformAdapter):
         )
         preview = command[:1800] + "..." if len(command) > 1800 else command
         text = f"Command approval required\n\n{preview}\n\nReason: {description}"
+        # A client that cannot render callback buttons still has to be able to
+        # answer, so fall back to Hermes' typed approval command.
+        supported = self._callbacks_supported(peer_id)
+        if not supported:
+            text = f"{text}\n\n{self._approval_fallback_text()}"
         try:
             response = await self.client.send_message(
                 peer_id=peer_id,
                 message=self.format_message(text),
-                keyboard=self._approval_keyboard(approval_id),
+                keyboard=self._approval_keyboard(approval_id) if supported else None,
             )
             return SendResult(success=True, message_id=str(response))
         except Exception as exc:
@@ -1227,13 +1335,23 @@ class VKAdapter(BasePlatformAdapter):
         if not peer_id:
             return SendResult(success=False, error=f"Invalid VK peer_id: {chat_id!r}")
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
-        if clean_choices:
+        if clean_choices and self._callbacks_supported(peer_id):
             lines = [f"Question: {question}", ""]
             lines.extend(
                 f"{index}. {choice}"
                 for index, choice in enumerate(clean_choices[:8], start=1)
             )
             keyboard = self._clarify_keyboard(clean_choices, clarify_id)
+        elif clean_choices:
+            # No callback support: a numbered list the user answers by typing.
+            lines = [f"Question: {question}", "", self._clarify_fallback_text(clean_choices)]
+            keyboard = None
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                mark_awaiting_text(clarify_id)
+            except Exception as exc:
+                logger.debug("VK clarify text fallback failed: %s", type(exc).__name__)
         else:
             lines = [f"Question: {question}", "", "Reply in this chat with your answer."]
             keyboard = None

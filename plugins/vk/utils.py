@@ -191,3 +191,8 @@ def _reaction_id(value: Any) -> int | None:
         return None
     number = int(text)
     return number if number > 0 else None
+
+
+# Resolved names/titles and negotiated client capabilities.
+IDENTITY_MAX_ENTRIES = 256
+IDENTITY_TTL_SECONDS = 600.0

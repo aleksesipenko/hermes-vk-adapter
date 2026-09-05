@@ -427,6 +427,9 @@ async def test_group_slash_command_bypasses_mention_and_uses_command_type():
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._capabilities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._identities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter.client = None  # identity lookups degrade to numeric labels
     adapter.reactions = _ReactionConfig()
     adapter.mark_read_enabled = False
 
@@ -467,6 +470,9 @@ async def test_group_reply_to_bot_activates_plain_text_message():
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._capabilities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._identities = _BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter.client = None  # identity lookups degrade to numeric labels
     adapter.reactions = _ReactionConfig()
     adapter.mark_read_enabled = False
 
@@ -636,6 +642,8 @@ def _idempotent_adapter():
     adapter._interactive = InteractiveStore()
     adapter._last_actor = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
     adapter._last_inbound_cmid = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     adapter.reactions = ReactionConfig()
     adapter.mark_read_enabled = False
     return adapter

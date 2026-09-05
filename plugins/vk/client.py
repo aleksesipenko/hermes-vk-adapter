@@ -390,3 +390,16 @@ class VKRestClient:
 
     async def delete_reaction(self, *, peer_id: int, cmid: int) -> Any:
         return await self.call("messages.deleteReaction", peer_id=peer_id, cmid=int(cmid))
+
+    async def get_users(self, user_ids: list[int] | int) -> list[dict[str, Any]]:
+        """Resolve VK user names. Narrowest method a community token can use."""
+        ids = user_ids if isinstance(user_ids, list) else [user_ids]
+        response = await self.call("users.get", user_ids=",".join(str(i) for i in ids))
+        return response if isinstance(response, list) else []
+
+    async def get_conversation(self, peer_id: int) -> dict[str, Any]:
+        """Fetch one conversation's metadata (title for a group chat)."""
+        response = await self.call(
+            "messages.getConversationsById", peer_ids=int(peer_id), group_id=self.group_id
+        )
+        return response if isinstance(response, dict) else {}

@@ -75,6 +75,8 @@ def make_adapter(client=None, **overrides):
     adapter._interactive = InteractiveStore()
     adapter._last_actor = BoundedTTLCache(max_entries=32, ttl_seconds=3600)
     adapter._last_inbound_cmid = BoundedTTLCache(max_entries=32, ttl_seconds=3600)
+    adapter._capabilities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
+    adapter._identities = BoundedTTLCache(max_entries=16, ttl_seconds=600)
     for key, value in overrides.items():
         setattr(adapter, key, value)
     return adapter
