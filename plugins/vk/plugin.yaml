@@ -54,3 +54,15 @@ optional_env:
     description: Логировать raw Long Poll updates для диагностики
     prompt: Диагностировать VK updates
     password: false
+  - name: VK_REACTION_PROCESSING_ID
+    description: 'Числовой id VK-реакции «в работе». По умолчанию выключено. Только число; эмодзи не подбираются автоматически.'
+    prompt: Числовой id реакции «в работе»
+    password: false
+  - name: VK_REACTION_DONE_ID
+    description: 'Числовой id VK-реакции «готово». Если не задан, реакция «в работе» просто снимается.'
+    prompt: Числовой id реакции «готово»
+    password: false
+  - name: VK_DISABLE_MARK_READ
+    description: 'Поставь true, чтобы не отмечать входящие сообщения прочитанными.'
+    prompt: Отключить отметку о прочтении
+    password: false

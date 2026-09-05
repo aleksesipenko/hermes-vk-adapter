@@ -356,3 +356,37 @@ class VKRestClient:
         if not ref:
             raise RuntimeError(f"Cannot build VK photo attachment ref from: {photo_obj}")
         return ref
+
+    async def delete_message(
+        self,
+        *,
+        peer_id: int,
+        message_ids: int | None = None,
+        cmids: int | None = None,
+        delete_for_all: bool = True,
+    ) -> Any:
+        """Delete one of our own messages. Never retried: a repeat is unclear."""
+        params: dict[str, Any] = {"peer_id": peer_id, "delete_for_all": 1 if delete_for_all else 0}
+        if message_ids:
+            params["message_ids"] = int(message_ids)
+        if cmids:
+            params["cmids"] = int(cmids)
+        return await self.call("messages.delete", **params)
+
+    async def mark_as_read(self, *, peer_id: int, start_message_id: int | None = None) -> Any:
+        params: dict[str, Any] = {"peer_id": peer_id, "group_id": self.group_id}
+        if start_message_id:
+            params["start_message_id"] = int(start_message_id)
+        return await self.call("messages.markAsRead", **params)
+
+    async def send_reaction(self, *, peer_id: int, cmid: int, reaction_id: int) -> Any:
+        """Add a reaction. VK keys reactions on cmid, not the global id."""
+        return await self.call(
+            "messages.sendReaction",
+            peer_id=peer_id,
+            cmid=int(cmid),
+            reaction_id=int(reaction_id),
+        )
+
+    async def delete_reaction(self, *, peer_id: int, cmid: int) -> Any:
+        return await self.call("messages.deleteReaction", peer_id=peer_id, cmid=int(cmid))

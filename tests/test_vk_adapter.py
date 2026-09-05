@@ -21,6 +21,7 @@ from plugins.vk.adapter import (
     register,
 )
 from plugins.vk.state import BoundedTTLCache as _BoundedTTLCache
+from plugins.vk.utils import ReactionConfig as _ReactionConfig
 from plugins.vk.utils import _vk_attachment_ref
 
 # Importing the adapter requires the real Hermes contract.
@@ -425,6 +426,9 @@ async def test_group_slash_command_bypasses_mention_and_uses_command_type():
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter.reactions = _ReactionConfig()
+    adapter.mark_read_enabled = False
 
     await VKAdapter._handle_message_new(
         adapter,
@@ -462,6 +466,9 @@ async def test_group_reply_to_bot_activates_plain_text_message():
     adapter.handle_message = fake_handle_message
     adapter._extract_media = fake_extract_media
     adapter._last_actor = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._last_inbound_cmid = _BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter.reactions = _ReactionConfig()
+    adapter.mark_read_enabled = False
 
     await VKAdapter._handle_message_new(
         adapter,
@@ -606,6 +613,7 @@ def _idempotent_adapter():
     """An adapter wired just enough to exercise send()."""
     from plugins.vk.interactive import InteractiveStore
     from plugins.vk.state import BoundedTTLCache
+    from plugins.vk.utils import ReactionConfig
 
     class FakeClient:
         def __init__(self):
@@ -627,6 +635,9 @@ def _idempotent_adapter():
     adapter._outbound_random_ids = BoundedTTLCache(max_entries=64, ttl_seconds=120)
     adapter._interactive = InteractiveStore()
     adapter._last_actor = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter._last_inbound_cmid = BoundedTTLCache(max_entries=16, ttl_seconds=3600)
+    adapter.reactions = ReactionConfig()
+    adapter.mark_read_enabled = False
     return adapter
 
 

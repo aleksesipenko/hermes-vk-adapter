@@ -53,7 +53,9 @@ from .utils import (
     SEEN_EVENT_MAX_ENTRIES,
     SEEN_EVENT_TTL_SECONDS,
     VK_MAX_ATTACHMENTS,
+    VK_MESSAGE_EDIT_LIMIT,
     VK_MESSAGE_SEND_LIMIT,
+    ReactionConfig,
     _csv_set,
     _largest_photo_url,
     _safe_int,
@@ -103,6 +105,9 @@ class VKAdapter(BasePlatformAdapter):
             or (str(os.getenv("VK_COMMAND_KEYBOARD", "")).lower() == "false")
         )
         self.debug_updates = _truthy(os.getenv("VK_DEBUG_UPDATES"))
+        # Cosmetic, opt-in, explicit numeric ids only.
+        self.reactions = ReactionConfig.from_env()
+        self.mark_read_enabled = not _truthy(os.getenv("VK_DISABLE_MARK_READ"))
         self.allowed_users = _csv_set(os.getenv("VK_ALLOWED_USERS"))
         self.allow_all_users = _truthy(os.getenv("VK_ALLOW_ALL_USERS"))
         self.client: VKRestClient | None = None
@@ -115,6 +120,11 @@ class VKAdapter(BasePlatformAdapter):
         # but no user_id, and in a group chat the peer alone cannot say who the
         # prompt is for -- see _actor_for_peer.
         self._last_actor = BoundedTTLCache(
+            max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
+        )
+        # The cmid of the last inbound message per peer -- VK keys reactions on
+        # conversation_message_id, never on the global message id.
+        self._last_inbound_cmid = BoundedTTLCache(
             max_entries=LAST_ACTOR_MAX_ENTRIES, ttl_seconds=LAST_ACTOR_TTL_SECONDS
         )
         self._keyboards = VKKeyboardFactory()
@@ -297,6 +307,7 @@ class VKAdapter(BasePlatformAdapter):
                         random_id=random_id,
                     )
                 sent_ids.append(str(response))
+            await self._react_done(peer_id)
             return SendResult(
                 success=True,
                 message_id=sent_ids[-1] if sent_ids else None,
@@ -391,6 +402,108 @@ class VKAdapter(BasePlatformAdapter):
                 metadata=metadata,
                 **kwargs,
             )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a message we sent, continuing past VK's edit limit.
+
+        messages.edit caps text far lower than messages.send. Silently
+        truncating a streamed final answer to fit would lose content, so the
+        first slice replaces the original message and the remainder is sent as
+        follow-up messages, reported through Hermes' continuation fields.
+        """
+        if not self.client:
+            return SendResult(success=False, error="VK adapter is not connected", retryable=True)
+        peer_id = _safe_int(chat_id)
+        target_id = _safe_int(message_id)
+        if not peer_id or not target_id:
+            return SendResult(
+                success=False, error=f"Invalid VK edit target: {chat_id!r}/{message_id!r}"
+            )
+
+        chunks = chunk_vk_text(self.format_message(content or ""), VK_MESSAGE_EDIT_LIMIT)
+        if not chunks:
+            chunks = [""]
+        try:
+            await self.client.edit_message(
+                peer_id=peer_id, message_id=target_id, message=chunks[0]
+            )
+            sent_ids = [str(target_id)]
+            for index, chunk in enumerate(chunks[1:], start=1):
+                response = await self.client.send_message(
+                    peer_id=peer_id,
+                    message=chunk,
+                    random_id=self._chunk_random_id(peer_id, index, chunk),
+                )
+                sent_ids.append(str(response))
+        except Exception as exc:
+            logger.warning("VK edit failed peer_id=%s: %s", peer_id, redact_secrets(exc))
+            return self._failed_send(exc)
+
+        return SendResult(
+            success=True,
+            message_id=sent_ids[-1],
+            continuation_message_ids=tuple(sent_ids[:-1]),
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete one of our messages. Best-effort: never raises."""
+        if not self.client:
+            return False
+        peer_id = _safe_int(chat_id)
+        target_id = _safe_int(message_id)
+        if not peer_id or not target_id:
+            return False
+        try:
+            await self.client.delete_message(peer_id=peer_id, message_ids=target_id)
+        except Exception as exc:
+            logger.debug("VK delete failed peer_id=%s: %s", peer_id, redact_secrets(exc))
+            return False
+        return True
+
+    async def _mark_read(self, peer_id: int, message_id: int) -> None:
+        """Best-effort read receipt for an already-authorized message."""
+        if not self.mark_read_enabled or not self.client or not peer_id:
+            return
+        try:
+            await self.client.mark_as_read(peer_id=peer_id, start_message_id=message_id)
+        except Exception as exc:
+            logger.debug("VK markAsRead failed peer_id=%s: %s", peer_id, redact_secrets(exc))
+
+    async def _react_processing(self, peer_id: int, cmid: int) -> None:
+        """Show the configured "working on it" reaction, if any."""
+        reaction_id = self.reactions.processing
+        if not reaction_id or not cmid or not self.client:
+            return
+        await self._react(peer_id, cmid, reaction_id)
+
+    async def _react_done(self, peer_id: int) -> None:
+        """Close out the lifecycle reaction on the message we replied to."""
+        if not self.reactions.enabled or not self.client:
+            return
+        cmid = _safe_int(self._last_inbound_cmid.get(peer_id), 0)
+        if not cmid:
+            return
+        if self.reactions.done:
+            await self._react(peer_id, cmid, self.reactions.done)
+            return
+        try:
+            await self.client.delete_reaction(peer_id=peer_id, cmid=cmid)
+        except Exception as exc:
+            logger.debug("VK deleteReaction failed peer_id=%s: %s", peer_id, redact_secrets(exc))
+
+    async def _react(self, peer_id: int, cmid: int, reaction_id: int) -> None:
+        """Reactions are decoration: a failure must never affect delivery."""
+        try:
+            await self.client.send_reaction(peer_id=peer_id, cmid=cmid, reaction_id=reaction_id)
+        except Exception as exc:
+            logger.debug("VK sendReaction failed peer_id=%s: %s", peer_id, redact_secrets(exc))
 
     @staticmethod
     def _is_vk_photo_path(path: str) -> bool:
@@ -796,6 +909,14 @@ class VKAdapter(BasePlatformAdapter):
         # Remember who spoke: an interactive prompt raised during this turn is
         # bound to them (Hermes' hooks pass no user_id).
         self._last_actor.set(peer_id, from_id)
+        # Only now -- after the allowlist accepted the sender. Acknowledging
+        # earlier would confirm to a stranger that the bot is live and read
+        # their message.
+        inbound_cmid = _safe_int(message.get("conversation_message_id"), 0)
+        if inbound_cmid:
+            self._last_inbound_cmid.set(peer_id, inbound_cmid)
+        await self._mark_read(peer_id, _safe_int(message.get("id"), 0))
+        await self._react_processing(peer_id, inbound_cmid)
 
         media_paths, media_types, inferred_type = await self._extract_media(message)
         if text.startswith("/"):
