@@ -54,22 +54,11 @@ optional_env:
     description: 'Логировать структуру Long Poll updates (ts, количество и типы). Тексты сообщений и payload не логируются.'
     prompt: Диагностировать VK updates
     password: false
-  - name: VK_REACTION_PROCESSING_ID
-    description: 'Числовой id VK-реакции «в работе». По умолчанию выключено. Только число; эмодзи не подбираются автоматически.'
-    prompt: Числовой id реакции «в работе»
-    password: false
-  - name: VK_REACTION_DONE_ID
-    description: 'Числовой id VK-реакции «готово». Если не задан, реакция «в работе» просто снимается.'
-    prompt: Числовой id реакции «готово»
-    password: false
   - name: VK_DISABLE_MARK_READ
     description: 'Поставь true, чтобы не отмечать входящие сообщения прочитанными.'
     prompt: Отключить отметку о прочтении
     password: false
-  - name: VK_REACTION_FAILED_ID
-    description: 'Числовой id VK-реакции «ошибка». Необязательно; по умолчанию выключено.'
-    prompt: Числовой id реакции «ошибка»
-    password: false
+
   - name: VK_COMMAND_KEYBOARD_DISABLED
     description: 'Устаревший синоним VK_COMMAND_KEYBOARD=false. Поставь true, чтобы скрыть клавиатуру команд.'
     prompt: Скрыть клавиатуру команд

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -152,40 +151,15 @@ GROUP_PEER_ID_BASE = 2_000_000_000
 
 @dataclass(frozen=True)
 class ReactionConfig:
-    """Numeric VK reaction ids for the message lifecycle.
+    """VK's default reaction ids for the message lifecycle."""
 
-    Reactions are opt-in and cosmetic. VK identifies a reaction by a numeric
-    id, and the community token used here cannot call
-    ``messages.getReactionsAssets`` to discover which id means what -- so the
-    operator configures the exact numbers they want and nothing is guessed. An
-    unset, non-numeric or non-positive value simply leaves that step off.
-    """
-
-    processing: int | None = None
-    done: int | None = None
-    failed: int | None = None
+    processing: int | None = 10  # 👌
+    done: int | None = 4  # 👍
+    failed: int | None = 8  # 😡
 
     @property
     def enabled(self) -> bool:
         return any((self.processing, self.done, self.failed))
-
-    @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> ReactionConfig:
-        source = env if env is not None else os.environ
-        return cls(
-            processing=_reaction_id(source.get("VK_REACTION_PROCESSING_ID")),
-            done=_reaction_id(source.get("VK_REACTION_DONE_ID")),
-            failed=_reaction_id(source.get("VK_REACTION_FAILED_ID")),
-        )
-
-
-def _reaction_id(value: Any) -> int | None:
-    """A configured reaction id, or None when it is absent or unusable."""
-    text = str(value or "").strip()
-    if not text.isdigit():
-        return None
-    number = int(text)
-    return number if number > 0 else None
 
 
 # Resolved names/titles and negotiated client capabilities.

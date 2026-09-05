@@ -137,8 +137,7 @@ class VKAdapter(BasePlatformAdapter):
             or (str(os.getenv("VK_COMMAND_KEYBOARD", "")).lower() == "false")
         )
         self.debug_updates = _truthy(os.getenv("VK_DEBUG_UPDATES"))
-        # Cosmetic, opt-in, explicit numeric ids only.
-        self.reactions = ReactionConfig.from_env()
+        self.reactions = ReactionConfig()
         self.mark_read_enabled = not _truthy(os.getenv("VK_DISABLE_MARK_READ"))
         self.allowed_users = _csv_set(os.getenv("VK_ALLOWED_USERS"))
         self.allow_all_users = _truthy(os.getenv("VK_ALLOW_ALL_USERS"))

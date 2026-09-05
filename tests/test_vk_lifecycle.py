@@ -190,40 +190,11 @@ async def test_delete_failure_returns_false_rather_than_raising():
 # ── reaction configuration ────────────────────────────────────────────────
 
 
-def test_reactions_are_disabled_by_default():
-    config = ReactionConfig.from_env({})
-
-    assert config.enabled is False
-    assert config.processing is None
-    assert config.done is None
-
-
-def test_reactions_accept_only_positive_numeric_ids():
-    config = ReactionConfig.from_env(
-        {"VK_REACTION_PROCESSING_ID": "1", "VK_REACTION_DONE_ID": "16"}
-    )
+def test_default_reactions_are_hardcoded():
+    config = ReactionConfig()
 
     assert config.enabled is True
-    assert config.processing == 1
-    assert config.done == 16
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        {"VK_REACTION_PROCESSING_ID": "heart"},
-        {"VK_REACTION_PROCESSING_ID": "-3"},
-        {"VK_REACTION_PROCESSING_ID": "0"},
-        {"VK_REACTION_PROCESSING_ID": ""},
-        {"VK_REACTION_PROCESSING_ID": "1.5"},
-    ],
-)
-def test_invalid_reaction_ids_are_ignored_not_guessed(raw):
-    """No emoji-to-id table is invented; a bad value simply disables it."""
-    config = ReactionConfig.from_env(raw)
-
-    assert config.processing is None
-    assert config.enabled is False
+    assert (config.processing, config.done, config.failed) == (10, 4, 8)
 
 
 # ── reaction lifecycle ────────────────────────────────────────────────────
@@ -231,7 +202,7 @@ def test_invalid_reaction_ids_are_ignored_not_guessed(raw):
 
 @pytest.mark.asyncio
 async def test_no_reactions_are_sent_when_unconfigured():
-    adapter = make_adapter()
+    adapter = make_adapter(reactions=ReactionConfig(None, None, None))
 
     await VKAdapter._react_processing(adapter, GROUP_PEER, 42)
     await VKAdapter._react_done(adapter, GROUP_PEER)
@@ -268,7 +239,7 @@ async def test_done_reaction_replaces_the_processing_one():
 
 @pytest.mark.asyncio
 async def test_done_removes_the_reaction_when_no_done_id_is_configured():
-    adapter = make_adapter(reactions=ReactionConfig(processing=1))
+    adapter = make_adapter(reactions=ReactionConfig(processing=1, done=None, failed=None))
     adapter._cmid_by_anchor.set((GROUP_PEER, "7"), 42)
 
     await VKAdapter._react_done(adapter, GROUP_PEER, "7")
@@ -365,7 +336,7 @@ async def test_a_successful_reply_closes_the_lifecycle_reaction():
 
 @pytest.mark.asyncio
 async def test_replies_send_no_reactions_when_unconfigured():
-    adapter = make_adapter()
+    adapter = make_adapter(reactions=ReactionConfig(None, None, None))
     adapter._cmid_by_anchor.set((PEER, "7"), 3)
 
     await VKAdapter.send(adapter, str(PEER), "the answer", reply_to="7")
